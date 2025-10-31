@@ -1,0 +1,80 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vercel
+      POSTGRES_PASSWORD: vercel
+      POSTGRES_DB: vercel
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d vercel -U vercel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  api:
+    image: golang:1.24
+    working_dir: /workspace/api
+    command: go run ./cmd/api
+    environment:
+      APP_ENV: development
+      API_ADDR: ":4000"
+      DATABASE_URL: postgres://vercel:vercel@db:5432/vercel?sslmode=disable
+      BUILDER_URL: http://builder:5000
+      NGINX_CONFIG_PATH: /workspace/nginx/conf.d
+      INGRESS_DOMAIN_SUFFIX: .local.peep
+      NGINX_CONTAINER_NAME: peep-nginx
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - ./:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "4000:4000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  builder:
+    image: golang:1.24
+    working_dir: /workspace/builder
+    command: go run ./cmd/builder
+    environment:
+      APP_ENV: development
+      BUILDER_ADDR: ":5000"
+      DATABASE_URL: postgres://vercel:vercel@db:5432/vercel?sslmode=disable
+      DEPLOY_CALLBACK_URL: http://api:4000/builder/callback
+      LOG_CALLBACK_URL: http://api:4000/logs
+      DOCKER_HOST: unix:///var/run/docker.sock
+      BUILDER_WORKDIR: /tmp/peep
+    volumes:
+      - ./:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+      - builder-workdir:/tmp/peep
+    ports:
+      - "5001:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: peep-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  postgres-data:
+  builder-workdir:

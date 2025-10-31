@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: vercel
+          POSTGRES_PASSWORD: vercel
+          POSTGRES_DB: vercel
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -d vercel -U vercel"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Cache Go build and modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Verify gofmt
+        run: |
+          set -euo pipefail
+          files=$(git ls-files '*.go')
+          if [ -z "$files" ]; then
+            exit 0
+          fi
+          fmt_out=$(gofmt -l $files)
+          if [ -n "$fmt_out" ]; then
+            echo "Go formatting issues detected:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Wait for database
+        run: |
+          export PGPASSWORD=vercel
+          for attempt in {1..30}; do
+            if pg_isready -h localhost -p 5432 -U vercel -d vercel; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "database did not become ready in time" >&2
+          exit 1
+
+      - name: Run database migrations
+        working-directory: api
+        env:
+          DATABASE_URL: postgres://vercel:vercel@localhost:5432/vercel?sslmode=disable
+          DB_MIGRATIONS_DIR: ../db/migrations
+        run: |
+          go run ./cmd/migrate -command up
+          go run ./cmd/migrate -command status
+
+      - name: Go vet, test, build
+        run: |
+          bash ci/go-check.sh
