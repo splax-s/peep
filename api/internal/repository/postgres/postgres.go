@@ -56,6 +56,20 @@ func (r *Repository) GetUserByEmail(ctx context.Context, email string) (*domain.
 	return &u, nil
 }
 
+// GetUserByID retrieves a user by identifier.
+func (r *Repository) GetUserByID(ctx context.Context, id string) (*domain.User, error) {
+	const query = `SELECT id, email, password_hash, created_at FROM users WHERE id = $1`
+	row := r.pool.QueryRow(ctx, query, id)
+	var u domain.User
+	if err := row.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, repository.ErrNotFound
+		}
+		return nil, err
+	}
+	return &u, nil
+}
+
 // CreateTeam creates a team record.
 func (r *Repository) CreateTeam(ctx context.Context, team *domain.Team) error {
 	const query = `INSERT INTO teams (id, name, owner_id, max_projects, max_containers, storage_limit_mb, created_at)

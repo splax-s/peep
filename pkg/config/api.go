@@ -13,6 +13,7 @@ type APIConfig struct {
 	AccessTokenTTL      time.Duration
 	RefreshTokenTTL     time.Duration
 	BuilderURL          string
+	BuilderAuthToken    string
 	NginxConfigPath     string
 	NginxReloadCommand  string
 	NginxContainerName  string
@@ -21,6 +22,9 @@ type APIConfig struct {
 	LogBuffer           int
 	WebhookSecret       string
 	MetricsSampleEvery  time.Duration
+	RateLimitRedisAddr  string
+	RateLimitRedisPass  string
+	RateLimitRedisDB    int
 }
 
 // LoadAPIConfig constructs an APIConfig from environment variables.
@@ -35,6 +39,7 @@ func LoadAPIConfig() APIConfig {
 		AccessTokenTTL:      time.Duration(GetInt("ACCESS_TOKEN_TTL_MIN", 15)) * time.Minute,
 		RefreshTokenTTL:     time.Duration(GetInt("REFRESH_TOKEN_TTL_HOURS", 24)) * time.Hour,
 		BuilderURL:          GetString("BUILDER_URL", "http://builder:5000"),
+		BuilderAuthToken:    GetString("BUILDER_AUTH_TOKEN", ""),
 		NginxConfigPath:     GetString("NGINX_CONFIG_PATH", "/etc/nginx/conf.d"),
 		NginxReloadCommand:  GetString("NGINX_RELOAD_COMMAND", ""),
 		NginxContainerName:  GetString("NGINX_CONTAINER_NAME", ""),
@@ -43,5 +48,8 @@ func LoadAPIConfig() APIConfig {
 		LogBuffer:           GetInt("WS_LOG_BUFFER", 100),
 		WebhookSecret:       GetString("GIT_WEBHOOK_SECRET", "supersecret"),
 		MetricsSampleEvery:  time.Duration(GetInt("METRICS_SAMPLE_SECONDS", 10)) * time.Second,
+		RateLimitRedisAddr:  GetString("RATE_LIMIT_REDIS_ADDR", ""),
+		RateLimitRedisPass:  GetString("RATE_LIMIT_REDIS_PASSWORD", ""),
+		RateLimitRedisDB:    GetInt("RATE_LIMIT_REDIS_DB", 0),
 	}
 }

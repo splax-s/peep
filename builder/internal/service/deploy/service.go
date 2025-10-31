@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"log/slog"
@@ -24,7 +27,10 @@ import (
 	"github.com/splax/localvercel/pkg/config"
 )
 
-const defaultAppPort = nat.Port("3000/tcp")
+const (
+	defaultAppPort      = nat.Port("3000/tcp")
+	defaultHostFallback = "host.docker.internal"
+)
 
 // Request contains deployment parameters from the API.
 type Request struct {
@@ -53,6 +59,17 @@ type Service struct {
 	statusClient    *http.Client
 	logClient       *http.Client
 	callbackTimeout time.Duration
+}
+
+func (s Service) attachBuilderToken(req *http.Request) {
+	if req == nil {
+		return
+	}
+	token := strings.TrimSpace(s.cfg.BuilderAuthToken)
+	if token == "" {
+		return
+	}
+	req.Header.Set("X-Builder-Token", token)
 }
 
 // New creates a deployment service.
@@ -109,6 +126,14 @@ func (s Service) Handle(ctx context.Context, req Request) (Result, error) {
 		Image:        imageTag,
 		Timestamp:    time.Now().UTC(),
 	}, nil
+}
+
+// Health verifies builder dependencies are reachable.
+func (s Service) Health(ctx context.Context) error {
+	if s.docker == nil {
+		return errors.New("docker client not initialised")
+	}
+	return s.docker.Ping(ctx)
 }
 
 func (s Service) validateRequest(req Request) error {
@@ -235,6 +260,7 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		s.fail(req, imageTag, "container_start", err)
 		return
 	}
+	startedAt := time.Now().UTC()
 
 	url := s.resolveAccessURL(info)
 	s.logger.Info("deployment completed", "deployment_id", req.DeploymentID, "image", imageTag, "url", url)
@@ -242,10 +268,17 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		"container_id": info.ID,
 		"image":        imageTag,
 	}
+	hostIP := ""
+	hostPort := ""
 	if info.PortBinding != nil {
 		if bindings := info.PortBinding[defaultAppPort]; len(bindings) > 0 {
-			readyMeta["host_port"] = bindings[0].HostPort
-			readyMeta["host_ip"] = bindings[0].HostIP
+			hostPort = strings.TrimSpace(bindings[0].HostPort)
+			hostIP = strings.TrimSpace(bindings[0].HostIP)
+			if hostIP == "" || hostIP == "0.0.0.0" || hostIP == "127.0.0.1" {
+				hostIP = defaultHostFallback
+			}
+			readyMeta["host_port"] = hostPort
+			readyMeta["host_ip"] = hostIP
 		}
 	}
 	if len(buildTail) > 0 {
@@ -254,7 +287,7 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 	s.notifyStatus(req, "running", "ready", "deployment is running", imageTag, url, readyMeta, nil)
 	s.emitLog(req, "info", "deployment is running", map[string]any{"url": url, "container_id": info.ID})
 	if strings.TrimSpace(info.ID) != "" {
-		go s.watchContainer(req, info.ID, imageTag)
+		go s.watchContainer(req, info.ID, imageTag, hostIP, hostPort, startedAt)
 	}
 }
 
@@ -393,9 +426,20 @@ func (s Service) fail(req Request, imageTag, stage string, err error) {
 	})
 }
 
-func (s Service) watchContainer(req Request, containerID, image string) {
-	ctx := context.Background()
+func (s Service) watchContainer(req Request, containerID, image, hostIP, hostPort string, startedAt time.Time) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	if s.shouldSampleMetrics() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.sampleContainerMetrics(ctx, req, containerID, image, hostIP, hostPort, startedAt)
+		}()
+	}
+
 	exitCode, err := s.docker.WaitForStop(ctx, containerID)
+	cancel()
+	wg.Wait()
 	if err != nil {
 		s.logger.Warn("container wait failed", "deployment_id", req.DeploymentID, "container_id", containerID, "error", err)
 		s.notifyStatus(req, "failed", "container_exit", "failed to monitor container", image, "", map[string]any{
@@ -403,11 +447,25 @@ func (s Service) watchContainer(req Request, containerID, image string) {
 		}, err)
 		return
 	}
+	uptimeSeconds := int64(0)
+	if !startedAt.IsZero() {
+		uptimeSeconds = int64(time.Since(startedAt).Seconds())
+		if uptimeSeconds < 0 {
+			uptimeSeconds = 0
+		}
+	}
 	metadata := map[string]any{
-		"deployment_id": req.DeploymentID,
-		"project_id":    req.ProjectID,
-		"container_id":  containerID,
-		"exit_code":     exitCode,
+		"deployment_id":  req.DeploymentID,
+		"project_id":     req.ProjectID,
+		"container_id":   containerID,
+		"exit_code":      exitCode,
+		"uptime_seconds": uptimeSeconds,
+	}
+	if hostIP != "" {
+		metadata["host_ip"] = hostIP
+	}
+	if hostPort != "" {
+		metadata["host_port"] = hostPort
 	}
 	message := fmt.Sprintf("container exited with status %d", exitCode)
 	status := "stopped"
@@ -426,6 +484,92 @@ func (s Service) watchContainer(req Request, containerID, image string) {
 	if err := s.docker.RemoveContainer(ctx, containerID); err != nil {
 		s.logger.Warn("post-exit container cleanup failed", "deployment_id", req.DeploymentID, "container_id", containerID, "error", err)
 	}
+}
+
+func (s Service) shouldSampleMetrics() bool {
+	return s.statusClient != nil && s.cfg.DeployCallbackURL != "" && s.cfg.MetricsSampleEvery > 0
+}
+
+func (s Service) sampleContainerMetrics(ctx context.Context, req Request, containerID, image, hostIP, hostPort string, startedAt time.Time) {
+	interval := s.cfg.MetricsSampleEvery
+	if interval <= 0 {
+		return
+	}
+
+	if !s.sendMetricsSample(ctx, req, containerID, image, hostIP, hostPort, startedAt) {
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !s.sendMetricsSample(ctx, req, containerID, image, hostIP, hostPort, startedAt) {
+				return
+			}
+		}
+	}
+}
+
+func (s Service) sendMetricsSample(ctx context.Context, req Request, containerID, image, hostIP, hostPort string, startedAt time.Time) bool {
+	sampleCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	metrics, err := s.docker.ContainerMetrics(sampleCtx, containerID)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, docker.ErrNotFound) {
+			return false
+		}
+		s.logger.Warn("container metrics sample failed", "deployment_id", req.DeploymentID, "container_id", containerID, "error", err)
+		return true
+	}
+
+	cpuPercent := math.Round(metrics.CPUPercent*100) / 100
+	uptimeSeconds := int64(0)
+	if !startedAt.IsZero() {
+		uptimeSeconds = int64(time.Since(startedAt).Seconds())
+		if uptimeSeconds < 0 {
+			uptimeSeconds = 0
+		}
+	}
+
+	memBytes := int64(0)
+	if metrics.MemoryUsage > 0 {
+		if metrics.MemoryUsage > math.MaxInt64 {
+			memBytes = math.MaxInt64
+		} else {
+			memBytes = int64(metrics.MemoryUsage)
+		}
+	}
+
+	metadata := map[string]any{
+		"deployment_id":  req.DeploymentID,
+		"project_id":     req.ProjectID,
+		"container_id":   containerID,
+		"cpu_percent":    cpuPercent,
+		"memory_bytes":   memBytes,
+		"uptime_seconds": uptimeSeconds,
+	}
+	if metrics.MemoryLimit > 0 {
+		if metrics.MemoryLimit > math.MaxInt64 {
+			metadata["memory_limit_bytes"] = int64(math.MaxInt64)
+		} else {
+			metadata["memory_limit_bytes"] = int64(metrics.MemoryLimit)
+		}
+	}
+	if hostIP != "" {
+		metadata["host_ip"] = hostIP
+	}
+	if hostPort != "" {
+		metadata["host_port"] = hostPort
+	}
+
+	s.notifyStatus(req, "running", "metrics", "container metrics sample", image, "", metadata, nil)
+	return true
 }
 
 type statusPayload struct {
@@ -482,6 +626,7 @@ func (s Service) notifyStatus(req Request, status, stage, message, image, url st
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	s.attachBuilderToken(httpReq)
 
 	resp, err := s.statusClient.Do(httpReq)
 	if err != nil {
@@ -548,6 +693,7 @@ func (s Service) emitLog(req Request, level, message string, metadata map[string
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	s.attachBuilderToken(httpReq)
 	resp, err := s.logClient.Do(httpReq)
 	if err != nil {
 		s.logger.Warn("log callback failed", "deployment_id", req.DeploymentID, "error", err)

@@ -4,13 +4,13 @@ import "time"
 
 // Team represents a collaborative group with resource quotas.
 type Team struct {
-	ID              string
-	Name            string
-	OwnerID         string
-	MaxProjects     int
-	MaxContainers   int
-	StorageLimitMB  int
-	CreatedAt       time.Time
+	ID             string
+	Name           string
+	OwnerID        string
+	MaxProjects    int
+	MaxContainers  int
+	StorageLimitMB int
+	CreatedAt      time.Time
 }
 
 // TeamMember links a user to a team with a role.

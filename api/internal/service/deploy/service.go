@@ -154,7 +154,13 @@ func (s Service) ProcessCallback(ctx context.Context, payload CallbackPayload) e
 		return errors.New("deployment_id required")
 	}
 
+	metadata := mergeMetadata(payload)
 	status := mapBuilderStatus(payload.Status)
+
+	if strings.EqualFold(payload.Stage, "metrics") {
+		s.handleIngress(ctx, payload, metadata, status)
+		return nil
+	}
 	var completedAt *time.Time
 	if status == StatusFailed || status == StatusSuccess {
 		t := payload.Timestamp
@@ -164,7 +170,6 @@ func (s Service) ProcessCallback(ctx context.Context, payload CallbackPayload) e
 		completedAt = &t
 	}
 
-	metadata := mergeMetadata(payload)
 	var metadataBytes []byte
 	if len(metadata) > 0 {
 		metadataBytes = mustJSON(metadata)
@@ -340,7 +345,8 @@ func (s Service) handleIngress(ctx context.Context, payload CallbackPayload, met
 	opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if payload.Stage == "container_exit" {
+	stage := strings.ToLower(payload.Stage)
+	if stage == "container_exit" {
 		if err := s.containers.DeleteContainer(opCtx, containerID); err != nil {
 			s.logger.Warn("failed to remove container metadata", "deployment_id", payload.DeploymentID, "container_id", containerID, "error", err)
 		}
@@ -357,23 +363,40 @@ func (s Service) handleIngress(ctx context.Context, payload CallbackPayload, met
 	}
 
 	hostPort, ok := parseHostPort(metadata["host_port"])
-	if !ok {
+	if !ok && stage != "metrics" {
 		s.logger.Warn("missing host port for ingress update", "deployment_id", payload.DeploymentID, "container_id", containerID)
 		return
 	}
 	hostIP, _ := metadata["host_ip"].(string)
+	hostIP = strings.TrimSpace(hostIP)
 
 	container := domain.ProjectContainer{
 		ProjectID:   payload.ProjectID,
 		ContainerID: containerID,
 		Status:      status,
-		HostIP:      hostIP,
-		HostPort:    hostPort,
 		UpdatedAt:   time.Now().UTC(),
+	}
+	if hostIP != "" {
+		container.HostIP = hostIP
+	}
+	if ok && hostPort > 0 {
+		container.HostPort = hostPort
+	}
+	if cpu, ok := parseFloat(metadata["cpu_percent"]); ok {
+		container.CPUPercent = &cpu
+	}
+	if mem, ok := parseInt64(metadata["memory_bytes"]); ok {
+		container.MemoryBytes = &mem
+	}
+	if uptime, ok := parseInt64(metadata["uptime_seconds"]); ok {
+		container.UptimeSeconds = &uptime
 	}
 
 	if err := s.containers.UpsertContainer(opCtx, container); err != nil {
 		s.logger.Warn("failed to upsert container metadata", "deployment_id", payload.DeploymentID, "container_id", containerID, "error", err)
+		return
+	}
+	if stage == "metrics" {
 		return
 	}
 	if err := s.containers.RemoveStaleContainers(opCtx, payload.ProjectID, containerID); err != nil {
@@ -420,6 +443,61 @@ func parseHostPort(value any) (int, bool) {
 		return int(v), v > 0
 	case uint64:
 		return int(v), v > 0
+	}
+	return 0, false
+}
+
+func parseFloat(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		if f, err := v.Float64(); err == nil {
+			return f, true
+		}
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return 0, false
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+func parseInt64(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case float64:
+		return int64(v), true
+	case float32:
+		return int64(v), true
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i, true
+		}
+		if f, err := v.Float64(); err == nil {
+			return int64(f), true
+		}
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return 0, false
+		}
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return i, true
+		}
 	}
 	return 0, false
 }

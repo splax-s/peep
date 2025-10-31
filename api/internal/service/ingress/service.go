@@ -113,7 +113,7 @@ func (s *Service) writeConfig(project domain.Project, container domain.ProjectCo
 	}()
 
 	host := container.HostIP
-	if strings.TrimSpace(host) == "" || host == "0.0.0.0" {
+	if strings.TrimSpace(host) == "" || host == "0.0.0.0" || host == "127.0.0.1" {
 		host = "host.docker.internal"
 	}
 
@@ -121,6 +121,8 @@ func (s *Service) writeConfig(project domain.Project, container domain.ProjectCo
 server {
     listen 80;
     server_name %s;
+	error_page 404 /__peep_404.html;
+	error_page 502 503 504 /__peep_502.html;
     location / {
         proxy_pass http://%s:%d;
         proxy_http_version 1.1;
@@ -129,6 +131,14 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
+	location = /__peep_404.html {
+		internal;
+		alias /etc/nginx/errors/404.html;
+	}
+	location = /__peep_502.html {
+		internal;
+		alias /etc/nginx/errors/502.html;
+	}
 }
 `, time.Now().UTC().Format(time.RFC3339), s.serverName(project), host, container.HostPort)
 

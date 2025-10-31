@@ -4,10 +4,10 @@ import "sync"
 
 // Hub manages websocket subscriptions by project ID.
 type Hub struct {
-	mu       sync.RWMutex
-	clients  map[string]map[*Client]struct{}
-	register chan subscription
-	unreg    chan subscription
+	mu        sync.RWMutex
+	clients   map[string]map[*Client]struct{}
+	register  chan subscription
+	unreg     chan subscription
 	broadcast chan message
 }
 
@@ -26,9 +26,9 @@ type subscription struct {
 // NewHub creates an initialized Hub.
 func NewHub() *Hub {
 	h := &Hub{
-		clients:  make(map[string]map[*Client]struct{}),
-		register: make(chan subscription),
-		unreg:    make(chan subscription),
+		clients:   make(map[string]map[*Client]struct{}),
+		register:  make(chan subscription),
+		unreg:     make(chan subscription),
 		broadcast: make(chan message),
 	}
 	go h.run()

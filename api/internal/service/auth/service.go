@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"log/slog"
@@ -76,6 +77,23 @@ func (s Service) Login(ctx context.Context, email, password string) (*domain.Use
 	}
 	s.logger.Info("user logged in", "user_id", user.ID)
 	return user, tokens, nil
+}
+
+// Authorize validates a bearer token and returns the associated user and claims.
+func (s Service) Authorize(ctx context.Context, token string) (*domain.User, *jwtpkg.Claims, error) {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return nil, nil, errors.New("token required")
+	}
+	claims, err := jwtpkg.Parse(trimmed, s.cfg.JWTSecret)
+	if err != nil {
+		return nil, nil, err
+	}
+	user, err := s.users.GetUserByID(ctx, claims.UserID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return user, claims, nil
 }
 
 func (s Service) issueTokens(userID, teamID string) (TokenPair, error) {

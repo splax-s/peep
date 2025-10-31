@@ -1,8 +1,10 @@
 package httpx
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"log/slog"
 
@@ -11,10 +13,12 @@ import (
 
 // Router exposes HTTP endpoints for the builder service.
 type Router struct {
-	mux     *http.ServeMux
-	logger  *slog.Logger
-	deploy  deploy.Service
+	mux    *http.ServeMux
+	logger *slog.Logger
+	deploy deploy.Service
 }
+
+const healthCheckTimeout = 2 * time.Second
 
 // New creates and registers handlers.
 func New(logger *slog.Logger, deploySvc deploy.Service) *Router {
@@ -33,7 +37,38 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Router) routes() {
+	r.mux.HandleFunc("/healthz", r.handleHealth)
 	r.mux.HandleFunc("/deploy", r.handleDeploy)
+}
+
+func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		r.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), healthCheckTimeout)
+	defer cancel()
+	component := map[string]any{"status": "up"}
+	status := "ok"
+	if err := r.deploy.Health(ctx); err != nil {
+		status = "degraded"
+		component = map[string]any{
+			"status": "down",
+			"error":  err.Error(),
+		}
+	}
+	payload := map[string]any{
+		"status": status,
+		"components": map[string]any{
+			"docker": component,
+		},
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	code := http.StatusOK
+	if status != "ok" {
+		code = http.StatusServiceUnavailable
+	}
+	r.writeJSON(w, code, payload)
 }
 
 func (r *Router) handleDeploy(w http.ResponseWriter, req *http.Request) {

@@ -21,6 +21,13 @@ type ContainerInfo struct {
 	PortBinding nat.PortMap
 }
 
+// ContainerMetrics captures sampled runtime metrics for a container.
+type ContainerMetrics struct {
+	CPUPercent  float64
+	MemoryUsage uint64
+	MemoryLimit uint64
+}
+
 // BuildOutputCallback is invoked with incremental build messages.
 type BuildOutputCallback func(string)
 
@@ -236,6 +243,59 @@ func (c *Client) RunContainer(ctx context.Context, name, image string, cmd []str
 	}
 
 	return ContainerInfo{ID: r.ID, PortBinding: portsBinding}, nil
+}
+
+// ContainerMetrics fetches instantaneous CPU and memory usage for a container.
+func (c *Client) ContainerMetrics(ctx context.Context, containerID string) (ContainerMetrics, error) {
+	if strings.TrimSpace(containerID) == "" {
+		return ContainerMetrics{}, fmt.Errorf("container id cannot be empty")
+	}
+	resp, err := c.inner.ContainerStats(ctx, containerID, false)
+	if err != nil {
+		if client.IsErrNotFound(err) {
+			return ContainerMetrics{}, ErrNotFound
+		}
+		return ContainerMetrics{}, fmt.Errorf("container stats: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var stats types.StatsJSON
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(&stats); err != nil {
+		return ContainerMetrics{}, fmt.Errorf("decode container stats: %w", err)
+	}
+
+	metrics := ContainerMetrics{
+		CPUPercent:  calculateCPUPercent(stats),
+		MemoryUsage: calculateMemoryUsage(stats),
+		MemoryLimit: stats.MemoryStats.Limit,
+	}
+	return metrics, nil
+}
+
+func calculateCPUPercent(stats types.StatsJSON) float64 {
+	cpuDelta := float64(stats.CPUStats.CPUUsage.TotalUsage - stats.PreCPUStats.CPUUsage.TotalUsage)
+	systemDelta := float64(stats.CPUStats.SystemUsage - stats.PreCPUStats.SystemUsage)
+	if cpuDelta <= 0 || systemDelta <= 0 {
+		return 0
+	}
+	numCPUs := float64(len(stats.CPUStats.CPUUsage.PercpuUsage))
+	if numCPUs == 0 {
+		numCPUs = 1
+	}
+	return (cpuDelta / systemDelta) * numCPUs * 100
+}
+
+func calculateMemoryUsage(stats types.StatsJSON) uint64 {
+	usage := stats.MemoryStats.Usage
+	if stats.MemoryStats.Stats != nil {
+		if cache, ok := stats.MemoryStats.Stats["cache"]; ok {
+			if usage >= cache {
+				usage -= cache
+			}
+		}
+	}
+	return usage
 }
 
 func hasHostPort(settings *types.NetworkSettings) bool {

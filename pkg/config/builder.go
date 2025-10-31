@@ -19,6 +19,7 @@ type BuilderConfig struct {
 	DeployCallbackURL     string
 	DeployCallbackTimeout time.Duration
 	MetricsSampleEvery    time.Duration
+	BuilderAuthToken      string
 }
 
 // LoadBuilderConfig constructs a BuilderConfig from environment variables.
@@ -39,5 +40,6 @@ func LoadBuilderConfig() BuilderConfig {
 		DeployCallbackURL:     GetString("DEPLOY_CALLBACK_URL", ""),
 		DeployCallbackTimeout: time.Duration(GetInt("DEPLOY_CALLBACK_TIMEOUT_SECONDS", 10)) * time.Second,
 		MetricsSampleEvery:    time.Duration(GetInt("METRICS_SAMPLE_SECONDS", 10)) * time.Second,
+		BuilderAuthToken:      GetString("BUILDER_AUTH_TOKEN", ""),
 	}
 }

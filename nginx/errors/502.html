@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Temporary Outage · peep</title>
+    <style>
+        :root {
+            color-scheme: light dark;
+        }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: radial-gradient(120% 140% at 50% 0%, #1a1034 0%, #0f172a 60%, #0b1120 100%);
+            color: #f5f7ff;
+            font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        .card {
+            width: min(90vw, 520px);
+            padding: 3.5rem 3rem;
+            border-radius: 24px;
+            background: rgba(11, 17, 32, 0.75);
+            backdrop-filter: blur(18px);
+            box-shadow: 0 28px 70px rgba(15, 23, 42, 0.45);
+            border: 1px solid rgba(94, 129, 255, 0.25);
+            text-align: center;
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.35rem 0.9rem;
+            border-radius: 999px;
+            background: rgba(96, 165, 250, 0.18);
+            color: #c7d2fe;
+            font-size: 0.85rem;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+        }
+        h1 {
+            margin: 1.8rem 0 1rem;
+            font-size: clamp(2.4rem, 6vw, 3rem);
+            letter-spacing: -0.03em;
+        }
+        p {
+            margin: 0 0 2.4rem;
+            color: #dbe5ff;
+            font-size: 1.05rem;
+            line-height: 1.6;
+        }
+        .actions {
+            display: flex;
+            justify-content: center;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+        a {
+            text-decoration: none;
+            font-weight: 600;
+        }
+        .primary,
+        .secondary {
+            padding: 0.85rem 1.6rem;
+            border-radius: 12px;
+            transition: transform 160ms ease, box-shadow 160ms ease, opacity 160ms ease;
+        }
+        .primary {
+            background: linear-gradient(120deg, #38bdf8, #a855f7);
+            color: #0f172a;
+            box-shadow: 0 18px 42px rgba(129, 140, 248, 0.4);
+        }
+        .secondary {
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            color: #e2e8f0;
+        }
+        .primary:hover,
+        .primary:focus-visible,
+        .secondary:hover,
+        .secondary:focus-visible {
+            transform: translateY(-2px);
+            box-shadow: 0 22px 44px rgba(129, 140, 248, 0.45);
+        }
+        .secondary:hover,
+        .secondary:focus-visible {
+            box-shadow: 0 18px 36px rgba(15, 23, 42, 0.38);
+        }
+        footer {
+            margin-top: 2.6rem;
+            font-size: 0.85rem;
+            color: rgba(226, 232, 240, 0.6);
+            letter-spacing: 0.04em;
+        }
+        @media (max-width: 540px) {
+            .card {
+                padding: 2.6rem 2rem;
+            }
+            .actions {
+                flex-direction: column;
+            }
+            .primary,
+            .secondary {
+                width: 100%;
+                justify-content: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <main class="card">
+        <div class="badge">
+            <span>502</span>
+            <span>Service Unavailable</span>
+        </div>
+        <h1>Looks like the deployment is warming up.</h1>
+        <p>
+            The upstream instance isn&apos;t responding just yet. Give it a moment or redeploy if this state persists.
+            We&apos;ll restore the route automatically as soon as the service comes back online.
+        </p>
+        <div class="actions">
+            <a class="primary" href="https://github.com/splax/localvercel" target="_blank" rel="noreferrer">Check Deployment Guide</a>
+            <a class="secondary" href="mailto:support@peep.dev">Contact Support</a>
+        </div>
+        <footer>peep · intelligent previews for every deploy</footer>
+    </main>
+</body>
+</html>

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -66,7 +67,18 @@ func main() {
 	deploySvc := deploy.New(repo, repo, repo, ingressSvc, log, cfg, logSvc)
 	webhookSvc := webhook.New(repo, log, cfg)
 
-	router := httpx.NewRouter(log, authSvc, teamSvc, projectSvc, deploySvc, logSvc, webhookSvc)
+	limiter := httpx.NewMemoryRateLimiter()
+	if addr := strings.TrimSpace(cfg.RateLimitRedisAddr); addr != "" {
+		redisLimiter, err := httpx.NewRedisRateLimiter(addr, cfg.RateLimitRedisPass, cfg.RateLimitRedisDB, log)
+		if err != nil {
+			log.Warn("redis rate limiter unavailable", "error", err)
+		} else {
+			limiter = redisLimiter
+		}
+	}
+
+	router := httpx.NewRouter(log, authSvc, teamSvc, projectSvc, deploySvc, logSvc, webhookSvc, limiter, cfg.BuilderAuthToken, pool.Ping)
+	defer router.Close()
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
