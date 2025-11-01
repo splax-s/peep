@@ -12,11 +12,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"log/slog"
 
 	"github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/splax/localvercel/api/internal/domain"
 	"github.com/splax/localvercel/api/internal/repository"
 	"github.com/splax/localvercel/api/internal/service/auth"
@@ -30,18 +33,23 @@ import (
 
 // Router wires HTTP endpoints to services.
 type Router struct {
-	mux          *http.ServeMux
-	logger       *slog.Logger
-	auth         auth.Service
-	team         team.Service
-	project      project.Service
-	deploy       deploy.Service
-	logs         logs.Service
-	webhook      webhook.Service
-	upgrader     websocket.Upgrader
-	limiter      RateLimiter
-	builderToken string
-	dbHealth     func(context.Context) error
+	mux                *http.ServeMux
+	logger             *slog.Logger
+	auth               auth.Service
+	team               team.Service
+	project            project.Service
+	deploy             deploy.Service
+	logs               logs.Service
+	webhook            webhook.Service
+	upgrader           websocket.Upgrader
+	limiter            RateLimiter
+	builderToken       string
+	dbHealth           func(context.Context) error
+	metricsOnce        sync.Once
+	metricsInitialized bool
+	requestTotal       *prometheus.CounterVec
+	requestLatency     *prometheus.HistogramVec
+	rateLimitHits      *prometheus.CounterVec
 }
 
 const (
@@ -78,6 +86,7 @@ func NewRouter(logger *slog.Logger, authSvc auth.Service, teamSvc team.Service, 
 	if r.limiter == nil {
 		r.limiter = NewMemoryRateLimiter()
 	}
+	r.initMetrics()
 	r.register()
 	return r
 }
@@ -95,6 +104,7 @@ func (r *Router) Close() {
 }
 
 func (r *Router) register() {
+	r.mux.Handle("/metrics", promhttp.Handler())
 	r.mux.HandleFunc("/healthz", r.audit(r.handleHealthz))
 	r.mux.HandleFunc("/auth/signup", r.audit(r.withRateLimit(rateLimitSignup, rateWindowDefault, rateLimitKeyIP, r.handleSignup)))
 	r.mux.HandleFunc("/auth/login", r.audit(r.withRateLimit(rateLimitLogin, rateWindowDefault, rateLimitKeyIP, r.handleLogin)))
@@ -337,6 +347,7 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 		decision := r.limiter.Allow(key, rateLimitUserRead, rateWindowDefault)
 		r.applyRateHeaders(w, rateLimitUserRead, decision)
 		if !decision.allowed {
+			r.recordRateLimitHit(req.URL.Path, rateMetricKey(key))
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
@@ -362,6 +373,7 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 		decision := r.limiter.Allow(builderKey, rateLimitBuilderWrite, rateWindowDefault)
 		r.applyRateHeaders(w, rateLimitBuilderWrite, decision)
 		if !decision.allowed {
+			r.recordRateLimitHit(req.URL.Path, rateMetricKey(builderKey))
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
@@ -574,6 +586,7 @@ func (r *Router) audit(next http.HandlerFunc) http.HandlerFunc {
 			ctx = req.Context()
 		}
 		duration := time.Since(start)
+		r.recordRequestMetrics(req.Method, req.URL.Path, status, duration)
 		actor := "anonymous"
 		fields := []any{
 			"method", req.Method,

@@ -3,6 +3,7 @@ package httpx
 import (
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -108,6 +109,7 @@ func (r *Router) withRateLimit(limit int, window time.Duration, keyFn func(*http
 		decision := r.limiter.Allow(key, limit, window)
 		r.applyRateHeaders(w, limit, decision)
 		if !decision.allowed {
+			r.recordRateLimitHit(req.URL.Path, rateMetricKey(key))
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
@@ -135,4 +137,17 @@ func rateLimitKeyIP(req *http.Request) string {
 		host = "unknown"
 	}
 	return "ip:" + host
+}
+
+func rateMetricKey(key string) string {
+	if key == "" {
+		return "unknown"
+	}
+	if idx := strings.IndexRune(key, ':'); idx > 0 {
+		return key[:idx]
+	}
+	if strings.HasPrefix(key, "ip:") {
+		return "ip"
+	}
+	return key
 }
