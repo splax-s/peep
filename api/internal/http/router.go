@@ -105,17 +105,17 @@ func (r *Router) Close() {
 
 func (r *Router) register() {
 	r.mux.Handle("/metrics", promhttp.Handler())
-	r.mux.HandleFunc("/healthz", r.audit(r.handleHealthz))
-	r.mux.HandleFunc("/auth/signup", r.audit(r.withRateLimit(rateLimitSignup, rateWindowDefault, rateLimitKeyIP, r.handleSignup)))
-	r.mux.HandleFunc("/auth/login", r.audit(r.withRateLimit(rateLimitLogin, rateWindowDefault, rateLimitKeyIP, r.handleLogin)))
-	r.mux.HandleFunc("/teams", r.audit(r.handlerAuthRate(rateLimitUserWrite, rateWindowDefault, r.handleTeams)))
-	r.mux.HandleFunc("/projects", r.audit(r.handlerAuthRate(rateLimitUserWrite, rateWindowDefault, r.handleProjects)))
-	r.mux.HandleFunc("/projects/", r.audit(r.handlerAuthRate(rateLimitUserWrite, rateWindowDefault, r.handleProjectSubroutes)))
-	r.mux.HandleFunc("/deploy/", r.audit(r.handlerAuthRate(rateLimitUserRead, rateWindowDefault, r.handleDeploy)))
-	r.mux.HandleFunc("/logs/", r.audit(r.handleLogs))
-	r.mux.HandleFunc("/ws/logs", r.audit(r.handlerAuthRate(rateLimitWebsocket, rateWindowRealtime, r.handleLogsWS)))
-	r.mux.HandleFunc("/webhook/", r.audit(r.handleWebhook))
-	r.mux.HandleFunc("/builder/callback", r.audit(r.withRateLimit(rateLimitBuilderCallback, rateWindowDefault, rateLimitKeyIP, r.handleBuilderCallback)))
+	r.mux.HandleFunc("/healthz", r.audit("/healthz", r.handleHealthz))
+	r.mux.HandleFunc("/auth/signup", r.audit("/auth/signup", r.withRateLimit("/auth/signup", rateLimitSignup, rateWindowDefault, rateLimitKeyIP, r.handleSignup)))
+	r.mux.HandleFunc("/auth/login", r.audit("/auth/login", r.withRateLimit("/auth/login", rateLimitLogin, rateWindowDefault, rateLimitKeyIP, r.handleLogin)))
+	r.mux.HandleFunc("/teams", r.audit("/teams", r.handlerAuthRate("/teams", rateLimitUserWrite, rateWindowDefault, r.handleTeams)))
+	r.mux.HandleFunc("/projects", r.audit("/projects", r.handlerAuthRate("/projects", rateLimitUserWrite, rateWindowDefault, r.handleProjects)))
+	r.mux.HandleFunc("/projects/", r.audit("/projects/:id", r.handlerAuthRate("/projects/:id", rateLimitUserWrite, rateWindowDefault, r.handleProjectSubroutes)))
+	r.mux.HandleFunc("/deploy/", r.audit("/deploy/:id", r.handlerAuthRate("/deploy/:id", rateLimitUserRead, rateWindowDefault, r.handleDeploy)))
+	r.mux.HandleFunc("/logs/", r.audit("/logs/:project_id", r.handleLogs))
+	r.mux.HandleFunc("/ws/logs", r.audit("/ws/logs", r.handlerAuthRate("/ws/logs", rateLimitWebsocket, rateWindowRealtime, r.handleLogsWS)))
+	r.mux.HandleFunc("/webhook/", r.audit("/webhook", r.handleWebhook))
+	r.mux.HandleFunc("/builder/callback", r.audit("/builder/callback", r.withRateLimit("/builder/callback", rateLimitBuilderCallback, rateWindowDefault, rateLimitKeyIP, r.handleBuilderCallback)))
 }
 
 func (r *Router) handleSignup(w http.ResponseWriter, req *http.Request) {
@@ -347,7 +347,7 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 		decision := r.limiter.Allow(key, rateLimitUserRead, rateWindowDefault)
 		r.applyRateHeaders(w, rateLimitUserRead, decision)
 		if !decision.allowed {
-			r.recordRateLimitHit(req.URL.Path, rateMetricKey(key))
+			r.recordRateLimitHit("/logs", rateMetricKey(key))
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
@@ -373,7 +373,7 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 		decision := r.limiter.Allow(builderKey, rateLimitBuilderWrite, rateWindowDefault)
 		r.applyRateHeaders(w, rateLimitBuilderWrite, decision)
 		if !decision.allowed {
-			r.recordRateLimitHit(req.URL.Path, rateMetricKey(builderKey))
+			r.recordRateLimitHit("/logs", rateMetricKey(builderKey))
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
@@ -476,7 +476,7 @@ func (r *Router) handleWebhook(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if len(parts) == 2 && parts[1] == "secret" {
-		r.handlerAuthRate(rateLimitUserWrite, rateWindowDefault, func(w http.ResponseWriter, req *http.Request) {
+		r.handlerAuthRate("/webhook/:project_id/secret", rateLimitUserWrite, rateWindowDefault, func(w http.ResponseWriter, req *http.Request) {
 			r.handleWebhookSecret(w, req, projectID)
 		})(w, req)
 		return
@@ -571,7 +571,7 @@ func (r *Router) handleHealthz(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, code, payload)
 }
 
-func (r *Router) audit(next http.HandlerFunc) http.HandlerFunc {
+func (r *Router) audit(route string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		recorder := &statusRecorder{ResponseWriter: w}
 		start := time.Now()
@@ -586,7 +586,11 @@ func (r *Router) audit(next http.HandlerFunc) http.HandlerFunc {
 			ctx = req.Context()
 		}
 		duration := time.Since(start)
-		r.recordRequestMetrics(req.Method, req.URL.Path, status, duration)
+		label := route
+		if label == "" {
+			label = req.URL.Path
+		}
+		r.recordRequestMetrics(req.Method, label, status, duration)
 		actor := "anonymous"
 		fields := []any{
 			"method", req.Method,

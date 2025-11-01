@@ -96,7 +96,7 @@ func (rl *memoryRateLimiter) Close() {
 	})
 }
 
-func (r *Router) withRateLimit(limit int, window time.Duration, keyFn func(*http.Request) string, next http.HandlerFunc) http.HandlerFunc {
+func (r *Router) withRateLimit(route string, limit int, window time.Duration, keyFn func(*http.Request) string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		if limit <= 0 || r.limiter == nil {
 			next(w, req)
@@ -109,7 +109,11 @@ func (r *Router) withRateLimit(limit int, window time.Duration, keyFn func(*http
 		decision := r.limiter.Allow(key, limit, window)
 		r.applyRateHeaders(w, limit, decision)
 		if !decision.allowed {
-			r.recordRateLimitHit(req.URL.Path, rateMetricKey(key))
+			label := route
+			if label == "" {
+				label = req.URL.Path
+			}
+			r.recordRateLimitHit(label, rateMetricKey(key))
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
@@ -117,8 +121,8 @@ func (r *Router) withRateLimit(limit int, window time.Duration, keyFn func(*http
 	}
 }
 
-func (r *Router) handlerAuthRate(limit int, window time.Duration, next http.HandlerFunc) http.HandlerFunc {
-	return r.requireAuth(r.withRateLimit(limit, window, r.rateLimitKeyUser, next))
+func (r *Router) handlerAuthRate(route string, limit int, window time.Duration, next http.HandlerFunc) http.HandlerFunc {
+	return r.requireAuth(r.withRateLimit(route, limit, window, r.rateLimitKeyUser, next))
 }
 
 func (r *Router) rateLimitKeyUser(req *http.Request) string {

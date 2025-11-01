@@ -4,18 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 
 	"log/slog"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/splax/localvercel/builder/internal/service/deploy"
 )
 
 // Router exposes HTTP endpoints for the builder service.
 type Router struct {
-	mux    *http.ServeMux
-	logger *slog.Logger
-	deploy deploy.Service
+	mux                *http.ServeMux
+	logger             *slog.Logger
+	deploy             deploy.Service
+	metricsOnce        sync.Once
+	metricsInitialized bool
+	requestTotal       *prometheus.CounterVec
+	requestDuration    *prometheus.HistogramVec
+	deployResults      *prometheus.CounterVec
 }
 
 const healthCheckTimeout = 2 * time.Second
@@ -27,6 +35,7 @@ func New(logger *slog.Logger, deploySvc deploy.Service) *Router {
 		logger: logger,
 		deploy: deploySvc,
 	}
+	r.initMetrics()
 	r.routes()
 	return r
 }
@@ -37,8 +46,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Router) routes() {
-	r.mux.HandleFunc("/healthz", r.handleHealth)
-	r.mux.HandleFunc("/deploy", r.handleDeploy)
+	r.mux.HandleFunc("/metrics", promhttp.Handler().ServeHTTP)
+	r.mux.HandleFunc("/healthz", r.instrument("/healthz", r.handleHealth))
+	r.mux.HandleFunc("/deploy", r.instrument("/deploy", r.handleDeploy))
 }
 
 func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
@@ -83,9 +93,11 @@ func (r *Router) handleDeploy(w http.ResponseWriter, req *http.Request) {
 	}
 	result, err := r.deploy.Handle(req.Context(), payload)
 	if err != nil {
+		r.recordDeployResult("failure")
 		r.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	r.recordDeployResult("success")
 	r.writeJSON(w, http.StatusAccepted, result)
 }
 
