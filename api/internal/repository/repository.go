@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"github.com/splax/localvercel/api/internal/domain"
 )
@@ -34,6 +35,7 @@ type ContainerRepository interface {
 	DeleteContainer(ctx context.Context, containerID string) error
 	ListProjectContainers(ctx context.Context, projectID string) ([]domain.ProjectContainer, error)
 	RemoveStaleContainers(ctx context.Context, projectID, activeContainerID string) error
+	ListContainers(ctx context.Context) ([]domain.ProjectContainer, error)
 }
 
 // DeploymentRepository stores deployment history.
@@ -41,6 +43,9 @@ type DeploymentRepository interface {
 	CreateDeployment(ctx context.Context, deployment *domain.Deployment) error
 	UpdateDeploymentStatus(ctx context.Context, update domain.DeploymentStatusUpdate) error
 	ListDeploymentsByProject(ctx context.Context, projectID string, limit int) ([]domain.Deployment, error)
+	ListDeploymentsWithStatusUpdatedBefore(ctx context.Context, status string, updatedBefore time.Time) ([]domain.Deployment, error)
+	GetDeploymentByID(ctx context.Context, deploymentID string) (*domain.Deployment, error)
+	DeleteDeployment(ctx context.Context, deploymentID string) error
 }
 
 // LogRepository handles log persistence and retrieval.

@@ -50,3 +50,11 @@ func (m *Manager) Cleanup(path string) error {
 	}
 	return os.RemoveAll(path)
 }
+
+// CleanupByID removes the workspace associated with the provided identifier.
+func (m *Manager) CleanupByID(identifier string) error {
+	if identifier == "" {
+		return fmt.Errorf("workspace identifier cannot be empty")
+	}
+	return m.Cleanup(filepath.Join(m.root, identifier))
+}

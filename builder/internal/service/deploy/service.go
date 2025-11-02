@@ -59,6 +59,56 @@ type Service struct {
 	statusClient    *http.Client
 	logClient       *http.Client
 	callbackTimeout time.Duration
+	logSuppressed   *sync.Map
+}
+
+type suppressionEntry struct {
+	expires time.Time
+}
+
+func (s Service) shouldSuppress(projectKey string) bool {
+	projectKey = strings.TrimSpace(projectKey)
+	if projectKey == "" || s.logSuppressed == nil {
+		return false
+	}
+	value, ok := s.logSuppressed.Load(projectKey)
+	if !ok {
+		return false
+	}
+	entry, ok := value.(suppressionEntry)
+	if !ok {
+		s.logSuppressed.Delete(projectKey)
+		return false
+	}
+	if entry.expires.IsZero() {
+		return true
+	}
+	if time.Now().Before(entry.expires) {
+		return true
+	}
+	s.logSuppressed.Delete(projectKey)
+	return false
+}
+
+func (s Service) suppress(projectKey string) {
+	projectKey = strings.TrimSpace(projectKey)
+	if projectKey == "" || s.logSuppressed == nil {
+		return
+	}
+	entry := suppressionEntry{}
+	ttl := s.cfg.CallbackSuppressionTTL
+	if ttl > 0 {
+		entry.expires = time.Now().Add(ttl)
+	}
+	s.logSuppressed.Store(projectKey, entry)
+}
+
+func (s Service) clearSuppression(projectKey string) {
+	projectKey = strings.TrimSpace(projectKey)
+	if projectKey == "" || s.logSuppressed == nil {
+		return
+	}
+	s.logSuppressed.Delete(projectKey)
 }
 
 func (s Service) attachBuilderToken(req *http.Request) {
@@ -94,6 +144,7 @@ func New(cli *docker.Client, ws *workspace.Manager, logger *slog.Logger, cfg con
 		statusClient:    statusClient,
 		logClient:       logClient,
 		callbackTimeout: timeout,
+		logSuppressed:   &sync.Map{},
 	}
 }
 
@@ -105,6 +156,7 @@ func (s Service) Handle(ctx context.Context, req Request) (Result, error) {
 	if err := s.validateRequest(req); err != nil {
 		return Result{}, err
 	}
+	s.clearSuppression(req.ProjectID)
 	if err := s.docker.Ping(ctx); err != nil {
 		return Result{}, err
 	}
@@ -116,7 +168,7 @@ func (s Service) Handle(ctx context.Context, req Request) (Result, error) {
 	s.logger.Debug("deployment request payload", "deployment_id", req.DeploymentID, "payload", string(payload))
 
 	imageTag := s.imageTag(req)
-	s.notifyStatus(req, "queued", "queued", "deployment queued", imageTag, "", map[string]any{"deployment_id": req.DeploymentID}, nil)
+	_ = s.notifyStatus(req, "queued", "queued", "deployment queued", imageTag, "", map[string]any{"deployment_id": req.DeploymentID}, nil)
 
 	go s.execute(context.Background(), req, imageTag)
 
@@ -136,6 +188,29 @@ func (s Service) Health(ctx context.Context) error {
 	return s.docker.Ping(ctx)
 }
 
+// Cancel stops a running deployment and cleans up related workspace state.
+func (s Service) Cancel(ctx context.Context, deploymentID string) error {
+	id := strings.TrimSpace(deploymentID)
+	if id == "" {
+		return fmt.Errorf("deployment id required")
+	}
+	if s.docker == nil {
+		return fmt.Errorf("docker client not initialised")
+	}
+	if err := s.docker.RemoveContainer(ctx, id); err != nil {
+		return err
+	}
+	if s.workspace != nil {
+		if err := s.workspace.CleanupByID(id); err != nil {
+			if s.logger != nil {
+				s.logger.Warn("workspace cleanup failed", "deployment_id", id, "error", err)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 func (s Service) validateRequest(req Request) error {
 	if strings.TrimSpace(req.RepoURL) == "" {
 		return fmt.Errorf("repository url required")
@@ -150,7 +225,7 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 	ctx, cancel := context.WithTimeout(rootCtx, s.cfg.BuildTimeout)
 	defer cancel()
 
-	s.notifyStatus(req, "building", "workspace", "preparing workspace", imageTag, "", map[string]any{"deployment_id": req.DeploymentID}, nil)
+	_ = s.notifyStatus(req, "building", "workspace", "preparing workspace", imageTag, "", map[string]any{"deployment_id": req.DeploymentID}, nil)
 	s.emitLog(req, "info", "preparing workspace", map[string]any{"deployment_id": req.DeploymentID})
 
 	workdir, err := s.workspace.Prepare(req.DeploymentID)
@@ -164,7 +239,7 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		}
 	}()
 
-	s.notifyStatus(req, "building", "clone", "cloning repository", imageTag, "", nil, nil)
+	_ = s.notifyStatus(req, "building", "clone", "cloning repository", imageTag, "", nil, nil)
 	gitCtx, cancelGit := context.WithTimeout(ctx, s.cfg.GitTimeout)
 	defer cancelGit()
 	if err := git.Clone(gitCtx, req.RepoURL, workdir); err != nil {
@@ -179,9 +254,36 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		return
 	}
 
-	if strings.TrimSpace(req.BuildCommand) != "" {
-		s.notifyStatus(req, "building", "build", "running build command", imageTag, "", nil, nil)
-		output, err := runCommand(ctx, req.BuildCommand, workdir, s.logger.With("deployment_id", req.DeploymentID, "stage", "build"))
+	runtimePrep, err := s.prepareRuntime(req, workdir)
+	if err != nil {
+		s.fail(req, imageTag, "runtime_prepare", err)
+		return
+	}
+	if runtimePrep.Name != "" {
+		meta := map[string]any{"runtime": runtimePrep.Name}
+		if runtimePrep.DockerfileGenerated {
+			meta["dockerfile_generated"] = true
+		}
+		if runtimePrep.BuildScriptEmbedded {
+			meta["build_script_embedded"] = true
+		}
+		if runtimePrep.PackageManager != "" {
+			meta["package_manager"] = runtimePrep.PackageManager
+		}
+		if runtimePrep.BuildTool != "" {
+			meta["build_tool"] = runtimePrep.BuildTool
+		}
+		s.emitLog(req, "info", "runtime prepared", meta)
+	}
+
+	buildCommand := strings.TrimSpace(req.BuildCommand)
+	if runtimePrep.SkipHostBuild {
+		buildCommand = ""
+	}
+
+	if buildCommand != "" {
+		_ = s.notifyStatus(req, "building", "build", "running build command", imageTag, "", nil, nil)
+		output, err := runCommand(ctx, buildCommand, workdir, s.logger.With("deployment_id", req.DeploymentID, "stage", "build"))
 		if err != nil {
 			s.fail(req, imageTag, "build", err)
 			if output != "" {
@@ -200,7 +302,7 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		return
 	}
 
-	s.notifyStatus(req, "building", "docker_build", "building container image", imageTag, "", nil, nil)
+	_ = s.notifyStatus(req, "building", "docker_build", "building container image", imageTag, "", nil, nil)
 	aggregator := newBuildLogAggregator(func(msg string) {
 		s.logger.Debug("docker build output", "deployment_id", req.DeploymentID, "line", msg)
 		s.emitLog(req, "info", "docker build output", map[string]any{
@@ -252,7 +354,7 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		defaultAppPort: []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: ""}},
 	}
 
-	s.notifyStatus(req, "starting", "container", "starting container", imageTag, "", nil, nil)
+	_ = s.notifyStatus(req, "starting", "container", "starting container", imageTag, "", nil, nil)
 	s.emitLog(req, "info", "starting container", map[string]any{"image": imageTag})
 
 	info, err := s.docker.RunContainer(ctx, req.DeploymentID, imageTag, cmd, nil, ports)
@@ -284,7 +386,7 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 	if len(buildTail) > 0 {
 		readyMeta["build_log_tail"] = buildTail
 	}
-	s.notifyStatus(req, "running", "ready", "deployment is running", imageTag, url, readyMeta, nil)
+	_ = s.notifyStatus(req, "running", "ready", "deployment is running", imageTag, url, readyMeta, nil)
 	s.emitLog(req, "info", "deployment is running", map[string]any{"url": url, "container_id": info.ID})
 	if strings.TrimSpace(info.ID) != "" {
 		go s.watchContainer(req, info.ID, imageTag, hostIP, hostPort, startedAt)
@@ -419,7 +521,7 @@ func parseCommand(command string) ([]string, error) {
 
 func (s Service) fail(req Request, imageTag, stage string, err error) {
 	s.logger.Error("deployment stage failed", "deployment_id", req.DeploymentID, "stage", stage, "error", err)
-	s.notifyStatus(req, "failed", stage, err.Error(), imageTag, "", nil, err)
+	_ = s.notifyStatus(req, "failed", stage, err.Error(), imageTag, "", nil, err)
 	s.emitLog(req, "error", fmt.Sprintf("%s failed: %v", stage, err), map[string]any{
 		"stage": stage,
 		"error": err.Error(),
@@ -442,7 +544,7 @@ func (s Service) watchContainer(req Request, containerID, image, hostIP, hostPor
 	wg.Wait()
 	if err != nil {
 		s.logger.Warn("container wait failed", "deployment_id", req.DeploymentID, "container_id", containerID, "error", err)
-		s.notifyStatus(req, "failed", "container_exit", "failed to monitor container", image, "", map[string]any{
+		_ = s.notifyStatus(req, "failed", "container_exit", "failed to monitor container", image, "", map[string]any{
 			"container_id": containerID,
 		}, err)
 		return
@@ -476,7 +578,7 @@ func (s Service) watchContainer(req Request, containerID, image, hostIP, hostPor
 		logLevel = "error"
 		notifyErr = fmt.Errorf("container exited with status %d", exitCode)
 	}
-	s.notifyStatus(req, status, "container_exit", message, image, "", metadata, notifyErr)
+	_ = s.notifyStatus(req, status, "container_exit", message, image, "", metadata, notifyErr)
 	s.emitLog(req, logLevel, "container exited", map[string]any{
 		"container_id": containerID,
 		"exit_code":    exitCode,
@@ -568,7 +670,9 @@ func (s Service) sendMetricsSample(ctx context.Context, req Request, containerID
 		metadata["host_port"] = hostPort
 	}
 
-	s.notifyStatus(req, "running", "metrics", "container metrics sample", image, "", metadata, nil)
+	if !s.notifyStatus(req, "running", "metrics", "container metrics sample", image, "", metadata, nil) {
+		return false
+	}
 	return true
 }
 
@@ -585,9 +689,13 @@ type statusPayload struct {
 	Metadata     map[string]interface{} `json:"metadata,omitempty"`
 }
 
-func (s Service) notifyStatus(req Request, status, stage, message, image, url string, metadata map[string]any, err error) {
+func (s Service) notifyStatus(req Request, status, stage, message, image, url string, metadata map[string]any, err error) bool {
 	if s.statusClient == nil || s.cfg.DeployCallbackURL == "" {
-		return
+		return true
+	}
+	projectKey := strings.TrimSpace(req.ProjectID)
+	if s.shouldSuppress(projectKey) {
+		return false
 	}
 	payload := statusPayload{
 		DeploymentID: req.DeploymentID,
@@ -607,7 +715,7 @@ func (s Service) notifyStatus(req Request, status, stage, message, image, url st
 	body, marshalErr := json.Marshal(payload)
 	if marshalErr != nil {
 		s.logger.Error("marshal callback payload failed", "deployment_id", req.DeploymentID, "error", marshalErr)
-		return
+		return false
 	}
 
 	ctx := context.Background()
@@ -623,7 +731,7 @@ func (s Service) notifyStatus(req Request, status, stage, message, image, url st
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.DeployCallbackURL, reqBody)
 	if err != nil {
 		s.logger.Warn("create callback request failed", "deployment_id", req.DeploymentID, "error", err)
-		return
+		return false
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	s.attachBuilderToken(httpReq)
@@ -631,7 +739,7 @@ func (s Service) notifyStatus(req Request, status, stage, message, image, url st
 	resp, err := s.statusClient.Do(httpReq)
 	if err != nil {
 		s.logger.Warn("callback request failed", "deployment_id", req.DeploymentID, "error", err)
-		return
+		return false
 	}
 	defer resp.Body.Close()
 	if _, copyErr := io.Copy(io.Discard, resp.Body); copyErr != nil {
@@ -639,7 +747,12 @@ func (s Service) notifyStatus(req Request, status, stage, message, image, url st
 	}
 	if resp.StatusCode >= http.StatusMultipleChoices {
 		s.logger.Warn("callback response status", "deployment_id", req.DeploymentID, "status_code", resp.StatusCode)
+		if resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError {
+			s.suppress(projectKey)
+			return false
+		}
 	}
+	return true
 }
 
 func (s Service) resolveAccessURL(info docker.ContainerInfo) string {
@@ -663,6 +776,10 @@ func (s Service) resolveAccessURL(info docker.ContainerInfo) string {
 
 func (s Service) emitLog(req Request, level, message string, metadata map[string]any) {
 	if s.logClient == nil || s.cfg.LogCallbackURL == "" {
+		return
+	}
+	projectKey := strings.TrimSpace(req.ProjectID)
+	if s.shouldSuppress(projectKey) {
 		return
 	}
 	payload := map[string]any{
@@ -690,6 +807,7 @@ func (s Service) emitLog(req Request, level, message string, metadata map[string
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, reqBody)
 	if err != nil {
 		s.logger.Warn("create log callback request failed", "deployment_id", req.DeploymentID, "error", err)
+		s.suppress(projectKey)
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -697,6 +815,7 @@ func (s Service) emitLog(req Request, level, message string, metadata map[string
 	resp, err := s.logClient.Do(httpReq)
 	if err != nil {
 		s.logger.Warn("log callback failed", "deployment_id", req.DeploymentID, "error", err)
+		s.suppress(projectKey)
 		return
 	}
 	defer resp.Body.Close()
@@ -705,6 +824,9 @@ func (s Service) emitLog(req Request, level, message string, metadata map[string
 	}
 	if resp.StatusCode >= http.StatusMultipleChoices {
 		s.logger.Warn("log callback response status", "deployment_id", req.DeploymentID, "status_code", resp.StatusCode)
+		if resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError {
+			s.suppress(projectKey)
+		}
 	}
 }
 

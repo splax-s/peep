@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/splax/localvercel/api/internal/domain"
@@ -214,6 +216,39 @@ func (r *Repository) ListDeploymentsByProject(ctx context.Context, projectID str
 	return deployments, rows.Err()
 }
 
+// GetDeploymentByID fetches a deployment by identifier.
+func (r *Repository) GetDeploymentByID(ctx context.Context, deploymentID string) (*domain.Deployment, error) {
+	const query = `SELECT id, project_id, commit_sha, status, stage, message, url, error, metadata, started_at, completed_at, updated_at
+		FROM deployments WHERE id = $1`
+	row := r.pool.QueryRow(ctx, query, deploymentID)
+	var d domain.Deployment
+	var completedAt sql.NullTime
+	if err := row.Scan(&d.ID, &d.ProjectID, &d.CommitSHA, &d.Status, &d.Stage, &d.Message, &d.URL, &d.Error, &d.Metadata, &d.StartedAt, &completedAt, &d.UpdatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, repository.ErrNotFound
+		}
+		return nil, err
+	}
+	if completedAt.Valid {
+		value := completedAt.Time
+		d.CompletedAt = &value
+	}
+	return &d, nil
+}
+
+// DeleteDeployment removes a deployment record.
+func (r *Repository) DeleteDeployment(ctx context.Context, deploymentID string) error {
+	const query = `DELETE FROM deployments WHERE id = $1`
+	cmdTag, err := r.pool.Exec(ctx, query, deploymentID)
+	if err != nil {
+		return err
+	}
+	if cmdTag.RowsAffected() == 0 {
+		return repository.ErrNotFound
+	}
+	return nil
+}
+
 func emptyToNil(value string) any {
 	if strings.TrimSpace(value) == "" {
 		return nil
@@ -247,6 +282,18 @@ func (r *Repository) AppendLog(ctx context.Context, log domain.ProjectLog) error
 	const query = `INSERT INTO project_logs (project_id, source, level, message, metadata, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6)`
 	_, err := r.pool.Exec(ctx, query, log.ProjectID, log.Source, log.Level, log.Message, log.Metadata, log.CreatedAt)
+	if err == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "22P02":
+			return repository.ErrInvalidArgument
+		case "23503":
+			return repository.ErrNotFound
+		}
+	}
 	return err
 }
 
@@ -372,9 +419,80 @@ func (r *Repository) ListProjectContainers(ctx context.Context, projectID string
 	return containers, rows.Err()
 }
 
+// ListContainers returns all tracked containers.
+func (r *Repository) ListContainers(ctx context.Context) ([]domain.ProjectContainer, error) {
+	const query = `SELECT id, project_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, created_at, updated_at FROM project_containers`
+	rows, err := r.pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var containers []domain.ProjectContainer
+	for rows.Next() {
+		var c domain.ProjectContainer
+		var (
+			cpu      sql.NullFloat64
+			mem      sql.NullInt64
+			uptime   sql.NullInt64
+			hostIP   sql.NullString
+			hostPort sql.NullInt64
+		)
+		if err := rows.Scan(&c.ID, &c.ProjectID, &c.ContainerID, &c.Status, &cpu, &mem, &uptime, &hostIP, &hostPort, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if cpu.Valid {
+			value := cpu.Float64
+			c.CPUPercent = &value
+		}
+		if mem.Valid {
+			value := mem.Int64
+			c.MemoryBytes = &value
+		}
+		if uptime.Valid {
+			value := uptime.Int64
+			c.UptimeSeconds = &value
+		}
+		if hostIP.Valid {
+			c.HostIP = hostIP.String
+		}
+		if hostPort.Valid {
+			c.HostPort = int(hostPort.Int64)
+		}
+		containers = append(containers, c)
+	}
+	return containers, rows.Err()
+}
+
 // RemoveStaleContainers removes all containers for a project except the active one.
 func (r *Repository) RemoveStaleContainers(ctx context.Context, projectID, activeContainerID string) error {
 	const query = `DELETE FROM project_containers WHERE project_id = $1 AND container_id <> $2`
 	_, err := r.pool.Exec(ctx, query, projectID, activeContainerID)
 	return err
+}
+
+// ListDeploymentsWithStatusUpdatedBefore finds deployments with a matching status updated before the cutoff.
+func (r *Repository) ListDeploymentsWithStatusUpdatedBefore(ctx context.Context, status string, updatedBefore time.Time) ([]domain.Deployment, error) {
+	const query = `SELECT id, project_id, commit_sha, status, stage, message, url, error, metadata, started_at, completed_at, updated_at
+		FROM deployments WHERE status = $1 AND updated_at < $2`
+	rows, err := r.pool.Query(ctx, query, status, updatedBefore)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deployments []domain.Deployment
+	for rows.Next() {
+		var d domain.Deployment
+		var completedAt sql.NullTime
+		if err := rows.Scan(&d.ID, &d.ProjectID, &d.CommitSHA, &d.Status, &d.Stage, &d.Message, &d.URL, &d.Error, &d.Metadata, &d.StartedAt, &completedAt, &d.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if completedAt.Valid {
+			value := completedAt.Time
+			d.CompletedAt = &value
+		}
+		deployments = append(deployments, d)
+	}
+	return deployments, rows.Err()
 }

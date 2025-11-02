@@ -70,6 +70,7 @@ services:
       BUILDER_AUTH_TOKEN: dev-builder-token
       DOCKER_HOST: unix:///var/run/docker.sock
       BUILDER_WORKDIR: /tmp/peep
+      CALLBACK_SUPPRESSION_TTL_SECONDS: "300"
     volumes:
       - ./:/workspace
       - /var/run/docker.sock:/var/run/docker.sock

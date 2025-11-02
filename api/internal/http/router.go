@@ -17,6 +17,7 @@ import (
 
 	"log/slog"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -112,6 +113,7 @@ func (r *Router) register() {
 	r.mux.HandleFunc("/projects", r.audit("/projects", r.handlerAuthRate("/projects", rateLimitUserWrite, rateWindowDefault, r.handleProjects)))
 	r.mux.HandleFunc("/projects/", r.audit("/projects/:id", r.handlerAuthRate("/projects/:id", rateLimitUserWrite, rateWindowDefault, r.handleProjectSubroutes)))
 	r.mux.HandleFunc("/deploy/", r.audit("/deploy/:id", r.handlerAuthRate("/deploy/:id", rateLimitUserRead, rateWindowDefault, r.handleDeploy)))
+	r.mux.HandleFunc("/deployments/", r.audit("/deployments/:id", r.handlerAuthRate("/deployments/:id", rateLimitUserWrite, rateWindowDefault, r.handleDeploymentDelete)))
 	r.mux.HandleFunc("/logs/", r.audit("/logs/:project_id", r.handleLogs))
 	r.mux.HandleFunc("/ws/logs", r.audit("/ws/logs", r.handlerAuthRate("/ws/logs", rateLimitWebsocket, rateWindowRealtime, r.handleLogsWS)))
 	r.mux.HandleFunc("/webhook/", r.audit("/webhook", r.handleWebhook))
@@ -300,6 +302,49 @@ func (r *Router) handleDeploy(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func (r *Router) handleDeploymentDelete(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodDelete {
+		r.methodNotAllowed(w)
+		return
+	}
+	if _, ok := authInfoFromContext(req.Context()); !ok {
+		r.logger.Error("auth context missing for deployment delete", "path", req.URL.Path)
+		writeError(w, http.StatusInternalServerError, "authorization context missing")
+		return
+	}
+	trimmed := strings.TrimPrefix(req.URL.Path, "/deployments/")
+	if trimmed == "" {
+		r.notFound(w)
+		return
+	}
+	parts := strings.SplitN(trimmed, "/", 2)
+	deploymentID := strings.TrimSpace(parts[0])
+	if deploymentID == "" {
+		r.notFound(w)
+		return
+	}
+	if len(parts) > 1 && parts[1] != "" {
+		r.notFound(w)
+		return
+	}
+	if _, err := uuid.Parse(deploymentID); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid deployment id")
+		return
+	}
+	if err := r.deploy.DeleteDeployment(req.Context(), deploymentID); err != nil {
+		switch {
+		case errors.Is(err, repository.ErrNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, repository.ErrInvalidArgument):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
 func (r *Router) handleBuilderCallback(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
 		r.methodNotAllowed(w)
@@ -317,6 +362,10 @@ func (r *Router) handleBuilderCallback(w http.ResponseWriter, req *http.Request)
 		status := http.StatusInternalServerError
 		if errors.Is(err, repository.ErrNotFound) {
 			status = http.StatusNotFound
+		} else if errors.Is(err, deploy.ErrInvalidProjectID) {
+			status = http.StatusBadRequest
+		} else if errors.Is(err, repository.ErrInvalidArgument) {
+			status = http.StatusBadRequest
 		}
 		writeError(w, status, err.Error())
 		return
@@ -423,7 +472,14 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 			entry.Message = fmt.Sprintf("[%s] %s", payload.Stage, entry.Message)
 		}
 		if err := r.logs.Append(req.Context(), entry); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			switch {
+			case errors.Is(err, repository.ErrInvalidArgument):
+				writeError(w, http.StatusBadRequest, "invalid project id")
+			case errors.Is(err, repository.ErrNotFound):
+				writeError(w, http.StatusNotFound, "project not found")
+			default:
+				writeError(w, http.StatusInternalServerError, err.Error())
+			}
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})

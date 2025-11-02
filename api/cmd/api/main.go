@@ -20,6 +20,7 @@ import (
 	"github.com/splax/localvercel/api/internal/service/ingress"
 	"github.com/splax/localvercel/api/internal/service/logs"
 	"github.com/splax/localvercel/api/internal/service/project"
+	runtimectl "github.com/splax/localvercel/api/internal/service/runtime"
 	"github.com/splax/localvercel/api/internal/service/team"
 	"github.com/splax/localvercel/api/internal/service/webhook"
 	"github.com/splax/localvercel/api/internal/ws"
@@ -66,6 +67,11 @@ func main() {
 	defer ingressSvc.Close()
 	deploySvc := deploy.New(repo, repo, repo, ingressSvc, log, cfg, logSvc)
 	webhookSvc := webhook.New(repo, log, cfg)
+
+	runtimeCtl := runtimectl.New(repo, repo, repo, ingressSvc, log, cfg)
+	if runtimeCtl != nil {
+		go runtimeCtl.Run(ctx)
+	}
 
 	limiter := httpx.NewMemoryRateLimiter()
 	if addr := strings.TrimSpace(cfg.RateLimitRedisAddr); addr != "" {

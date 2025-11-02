@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +50,7 @@ func (r *Router) routes() {
 	r.mux.HandleFunc("/metrics", promhttp.Handler().ServeHTTP)
 	r.mux.HandleFunc("/healthz", r.instrument("/healthz", r.handleHealth))
 	r.mux.HandleFunc("/deploy", r.instrument("/deploy", r.handleDeploy))
+	r.mux.HandleFunc("/deploy/", r.instrument("/deploy/:id", r.handleDeployDelete))
 }
 
 func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
@@ -99,6 +101,24 @@ func (r *Router) handleDeploy(w http.ResponseWriter, req *http.Request) {
 	}
 	r.recordDeployResult("success")
 	r.writeJSON(w, http.StatusAccepted, result)
+}
+
+func (r *Router) handleDeployDelete(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodDelete {
+		r.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	deploymentID := strings.TrimPrefix(req.URL.Path, "/deploy/")
+	deploymentID = strings.Trim(deploymentID, "/")
+	if deploymentID == "" {
+		r.writeError(w, http.StatusBadRequest, "deployment id required")
+		return
+	}
+	if err := r.deploy.Cancel(req.Context(), deploymentID); err != nil {
+		r.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	r.writeJSON(w, http.StatusAccepted, map[string]string{"status": "cancelling"})
 }
 
 func (r *Router) writeJSON(w http.ResponseWriter, status int, payload any) {

@@ -42,6 +42,24 @@ type Service struct {
 	logSvc      logs.Service
 }
 
+func (s Service) builderEndpoint(path string) string {
+	base := strings.TrimSpace(s.cfg.BuilderURL)
+	if base == "" {
+		if strings.HasPrefix(path, "/") {
+			return path
+		}
+		return "/" + path
+	}
+	base = strings.TrimSuffix(base, "/")
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return base + path
+}
+
+// ErrInvalidProjectID indicates the callback referenced a non-UUID project id.
+var ErrInvalidProjectID = errors.New("deploy: invalid project id")
+
 // New returns a deployment service.
 func New(projects repository.ProjectRepository, deployments repository.DeploymentRepository, containers repository.ContainerRepository, ingressSvc *ingress.Service, logger *slog.Logger, cfg config.APIConfig, logSvc logs.Service) Service {
 	return Service{
@@ -88,7 +106,7 @@ func (s Service) Trigger(ctx context.Context, projectID, commitSHA string) (*dom
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.BuilderURL+"/deploy", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.builderEndpoint("/deploy"), bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +147,84 @@ func (s Service) Trigger(ctx context.Context, projectID, commitSHA string) (*dom
 	return deployment, nil
 }
 
+// DeleteDeployment stops a running deployment, removes ingress, and deletes persistence state.
+func (s Service) DeleteDeployment(ctx context.Context, deploymentID string) error {
+	id := strings.TrimSpace(deploymentID)
+	if id == "" {
+		return fmt.Errorf("deployment id required")
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		return fmt.Errorf("invalid deployment id: %w", err)
+	}
+	deployment, err := s.deployments.GetDeploymentByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := s.cancelBuilderDeployment(ctx, id); err != nil {
+		s.logger.Warn("builder cancellation failed", "deployment_id", id, "error", err)
+	}
+	projectID := deployment.ProjectID
+	if err := s.cleanupContainers(ctx, projectID); err != nil {
+		s.logger.Warn("container cleanup failed", "project_id", projectID, "deployment_id", id, "error", err)
+	}
+	if err := s.removeIngress(ctx, projectID); err != nil {
+		s.logger.Warn("ingress removal failed", "project_id", projectID, "deployment_id", id, "error", err)
+	}
+	if err := s.deployments.DeleteDeployment(ctx, id); err != nil {
+		return err
+	}
+	s.logger.Info("deployment deleted", "deployment_id", id, "project_id", projectID)
+	return nil
+}
+
+func (s Service) cancelBuilderDeployment(ctx context.Context, deploymentID string) error {
+	if s.client == nil {
+		return errors.New("builder client not configured")
+	}
+	endpoint := s.builderEndpoint("/deploy/" + deploymentID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("builder cancel returned %s", resp.Status)
+	}
+	return nil
+}
+
+func (s Service) cleanupContainers(ctx context.Context, projectID string) error {
+	if s.containers == nil {
+		return nil
+	}
+	containers, err := s.containers.ListProjectContainers(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, container := range containers {
+		if err := s.containers.DeleteContainer(ctx, container.ContainerID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (s Service) removeIngress(ctx context.Context, projectID string) error {
+	if s.ingress == nil {
+		return nil
+	}
+	project, err := s.projects.GetProjectByID(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	return s.ingress.Remove(ctx, *project)
+}
+
 // CallbackPayload represents progress events from the builder service.
 type CallbackPayload struct {
 	DeploymentID string                 `json:"deployment_id"`
@@ -153,6 +249,14 @@ func (s Service) ProcessCallback(ctx context.Context, payload CallbackPayload) e
 	if strings.TrimSpace(payload.DeploymentID) == "" {
 		return errors.New("deployment_id required")
 	}
+	projectID := strings.TrimSpace(payload.ProjectID)
+	if projectID == "" {
+		return ErrInvalidProjectID
+	}
+	if _, err := uuid.Parse(projectID); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidProjectID, err)
+	}
+	payload.ProjectID = projectID
 
 	metadata := mergeMetadata(payload)
 	status := mapBuilderStatus(payload.Status)
@@ -272,6 +376,15 @@ func (s Service) emitDeploymentLog(ctx context.Context, payload CallbackPayload,
 	if s.logSvc.Hub() == nil {
 		return
 	}
+	projectID := strings.TrimSpace(payload.ProjectID)
+	if projectID == "" {
+		s.logger.Warn("missing project id for deployment log", "deployment_id", payload.DeploymentID)
+		return
+	}
+	if _, err := uuid.Parse(projectID); err != nil {
+		s.logger.Warn("invalid project id for deployment log", "deployment_id", payload.DeploymentID, "project_id", payload.ProjectID, "error", err)
+		return
+	}
 	metaBytes := metadata
 	if len(metaBytes) == 0 {
 		fallback := map[string]any{}
@@ -303,6 +416,7 @@ func (s Service) emitDeploymentLog(ctx context.Context, payload CallbackPayload,
 	if entry.Message == "" {
 		entry.Message = fmt.Sprintf("deployment %s status: %s", payload.DeploymentID, payload.Status)
 	}
+	entry.ProjectID = projectID
 	if err := s.logSvc.Append(ctx, entry); err != nil {
 		s.logger.Warn("failed to append deployment log", "deployment_id", payload.DeploymentID, "error", err)
 	}
@@ -341,6 +455,15 @@ func (s Service) handleIngress(ctx context.Context, payload CallbackPayload, met
 	if strings.TrimSpace(containerID) == "" {
 		return
 	}
+	projectID := strings.TrimSpace(payload.ProjectID)
+	if projectID == "" {
+		s.logger.Warn("missing project id for ingress update", "deployment_id", payload.DeploymentID)
+		return
+	}
+	if _, err := uuid.Parse(projectID); err != nil {
+		s.logger.Warn("invalid project id for ingress update", "deployment_id", payload.DeploymentID, "project_id", payload.ProjectID, "error", err)
+		return
+	}
 
 	opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -350,7 +473,7 @@ func (s Service) handleIngress(ctx context.Context, payload CallbackPayload, met
 		if err := s.containers.DeleteContainer(opCtx, containerID); err != nil {
 			s.logger.Warn("failed to remove container metadata", "deployment_id", payload.DeploymentID, "container_id", containerID, "error", err)
 		}
-		s.syncIngress(opCtx, payload.ProjectID)
+		s.syncIngress(opCtx, projectID)
 		return
 	}
 
@@ -358,7 +481,7 @@ func (s Service) handleIngress(ctx context.Context, payload CallbackPayload, met
 		if err := s.containers.DeleteContainer(opCtx, containerID); err != nil {
 			s.logger.Warn("failed to remove container metadata", "deployment_id", payload.DeploymentID, "container_id", containerID, "error", err)
 		}
-		s.syncIngress(opCtx, payload.ProjectID)
+		s.syncIngress(opCtx, projectID)
 		return
 	}
 
@@ -371,7 +494,7 @@ func (s Service) handleIngress(ctx context.Context, payload CallbackPayload, met
 	hostIP = strings.TrimSpace(hostIP)
 
 	container := domain.ProjectContainer{
-		ProjectID:   payload.ProjectID,
+		ProjectID:   projectID,
 		ContainerID: containerID,
 		Status:      status,
 		UpdatedAt:   time.Now().UTC(),
@@ -399,11 +522,11 @@ func (s Service) handleIngress(ctx context.Context, payload CallbackPayload, met
 	if stage == "metrics" {
 		return
 	}
-	if err := s.containers.RemoveStaleContainers(opCtx, payload.ProjectID, containerID); err != nil {
+	if err := s.containers.RemoveStaleContainers(opCtx, projectID, containerID); err != nil {
 		s.logger.Warn("failed to prune stale container metadata", "deployment_id", payload.DeploymentID, "container_id", containerID, "error", err)
 	}
 
-	s.syncIngress(opCtx, payload.ProjectID)
+	s.syncIngress(opCtx, projectID)
 }
 
 func (s Service) syncIngress(ctx context.Context, projectID string) {
