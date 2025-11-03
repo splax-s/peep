@@ -46,11 +46,19 @@ func New(projects repository.ProjectRepository, teams repository.TeamRepository,
 	return Service{projects: projects, teams: teams, logger: logger, cfg: cfg}
 }
 
+// EnvVar represents a decrypted environment variable for API responses.
+type EnvVar struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
 var (
 	errInvalidProjectName = errors.New("project name is required")
 	errInvalidRepoURL     = errors.New("repository URL is required")
 	errInvalidType        = errors.New("project type must be frontend or backend")
 	errInvalidEnvKey      = errors.New("environment variable key is required")
+	errMissingTeamID      = errors.New("team id required")
+	errMissingProjectID   = errors.New("project id required")
 )
 
 // Create registers a new project respecting team quotas.
@@ -109,4 +117,54 @@ func (s Service) AddEnvVar(ctx context.Context, input EnvVarInput) error {
 		CreatedAt: time.Now().UTC(),
 	}
 	return s.projects.UpsertEnvVar(ctx, envVar)
+}
+
+// ListByTeam returns projects owned by the team.
+func (s Service) ListByTeam(ctx context.Context, teamID string) ([]domain.Project, error) {
+	teamID = strings.TrimSpace(teamID)
+	if teamID == "" {
+		return nil, errMissingTeamID
+	}
+	projects, err := s.projects.ListProjectsByTeam(ctx, teamID)
+	if err != nil {
+		return nil, err
+	}
+	return projects, nil
+}
+
+// ListEnvVars decrypts stored environment variables for a project.
+func (s Service) ListEnvVars(ctx context.Context, projectID string) ([]EnvVar, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return nil, errMissingProjectID
+	}
+	stored, err := s.projects.ListProjectEnvVars(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	vars := make([]EnvVar, 0, len(stored))
+	for _, item := range stored {
+		value, err := crypto.DecryptToString(s.cfg.EnvEncryptionKey, item.Value)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("failed to decrypt env var", "project_id", projectID, "key", item.Key, "error", err)
+			}
+			continue
+		}
+		vars = append(vars, EnvVar{Key: item.Key, Value: value})
+	}
+	return vars, nil
+}
+
+// Get returns project details by identifier.
+func (s Service) Get(ctx context.Context, projectID string) (*domain.Project, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return nil, errMissingProjectID
+	}
+	project, err := s.projects.GetProjectByID(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	return project, nil
 }

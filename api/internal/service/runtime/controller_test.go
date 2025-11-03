@@ -166,6 +166,16 @@ func (r *testProjectRepo) GetProjectByID(ctx context.Context, projectID string) 
 	}
 	return &project, nil
 }
+func (r *testProjectRepo) ListProjectsByTeam(context.Context, string) ([]domain.Project, error) {
+	result := make([]domain.Project, 0, len(r.projects))
+	for _, project := range r.projects {
+		result = append(result, project)
+	}
+	return result, nil
+}
+func (r *testProjectRepo) ListProjectEnvVars(context.Context, string) ([]domain.ProjectEnvVar, error) {
+	return nil, nil
+}
 func newTestContainerRepo(initial []domain.ProjectContainer) *testContainerRepo {
 	repo := &testContainerRepo{containers: make(map[string]domain.ProjectContainer)}
 	for _, c := range initial {
@@ -188,6 +198,17 @@ func (r *testContainerRepo) DeleteContainer(ctx context.Context, containerID str
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.containers, containerID)
+	return nil
+}
+
+func (r *testContainerRepo) DeleteContainersByDeployment(ctx context.Context, deploymentID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, container := range r.containers {
+		if container.DeploymentID == deploymentID {
+			delete(r.containers, id)
+		}
+	}
 	return nil
 }
 

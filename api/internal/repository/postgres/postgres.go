@@ -114,6 +114,30 @@ func (r *Repository) GetTeamByID(ctx context.Context, teamID string) (*domain.Te
 	return &team, nil
 }
 
+// ListTeamsByUser returns teams the user belongs to.
+func (r *Repository) ListTeamsByUser(ctx context.Context, userID string) ([]domain.Team, error) {
+	const query = `SELECT t.id, t.name, t.owner_id, t.max_projects, t.max_containers, t.storage_limit_mb, t.created_at
+		FROM teams t
+		INNER JOIN team_members tm ON tm.team_id = t.id
+		WHERE tm.user_id = $1
+		ORDER BY t.created_at DESC`
+	rows, err := r.pool.Query(ctx, query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	teams := make([]domain.Team, 0)
+	for rows.Next() {
+		var team domain.Team
+		if err := rows.Scan(&team.ID, &team.Name, &team.OwnerID, &team.MaxProjects, &team.MaxContainers, &team.StorageLimitMB, &team.CreatedAt); err != nil {
+			return nil, err
+		}
+		teams = append(teams, team)
+	}
+	return teams, rows.Err()
+}
+
 // CreateProject inserts a project.
 func (r *Repository) CreateProject(ctx context.Context, project *domain.Project) error {
 	const query = `INSERT INTO projects (id, team_id, name, repo_url, type, build_command, run_command, created_at)
@@ -137,6 +161,27 @@ func (r *Repository) GetProjectByID(ctx context.Context, projectID string) (*dom
 	return &project, nil
 }
 
+// ListProjectsByTeam returns projects for the provided team.
+func (r *Repository) ListProjectsByTeam(ctx context.Context, teamID string) ([]domain.Project, error) {
+	const query = `SELECT id, team_id, name, repo_url, type, build_command, run_command, created_at
+		FROM projects WHERE team_id = $1 ORDER BY created_at DESC`
+	rows, err := r.pool.Query(ctx, query, teamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	projects := make([]domain.Project, 0)
+	for rows.Next() {
+		var project domain.Project
+		if err := rows.Scan(&project.ID, &project.TeamID, &project.Name, &project.RepoURL, &project.Type, &project.BuildCommand, &project.RunCommand, &project.CreatedAt); err != nil {
+			return nil, err
+		}
+		projects = append(projects, project)
+	}
+	return projects, rows.Err()
+}
+
 // UpsertEnvVar upserts an environment variable.
 func (r *Repository) UpsertEnvVar(ctx context.Context, envVar *domain.ProjectEnvVar) error {
 	const query = `INSERT INTO project_env_vars (project_id, key, value, created_at)
@@ -144,6 +189,26 @@ func (r *Repository) UpsertEnvVar(ctx context.Context, envVar *domain.ProjectEnv
 		ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`
 	_, err := r.pool.Exec(ctx, query, envVar.ProjectID, envVar.Key, envVar.Value, envVar.CreatedAt)
 	return err
+}
+
+// ListProjectEnvVars returns environment variables for a project.
+func (r *Repository) ListProjectEnvVars(ctx context.Context, projectID string) ([]domain.ProjectEnvVar, error) {
+	const query = `SELECT project_id, key, value, created_at FROM project_env_vars WHERE project_id = $1 ORDER BY key`
+	rows, err := r.pool.Query(ctx, query, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	vars := make([]domain.ProjectEnvVar, 0)
+	for rows.Next() {
+		var env domain.ProjectEnvVar
+		if err := rows.Scan(&env.ProjectID, &env.Key, &env.Value, &env.CreatedAt); err != nil {
+			return nil, err
+		}
+		vars = append(vars, env)
+	}
+	return vars, rows.Err()
 }
 
 // CreateDeployment inserts a deployment record.
@@ -343,18 +408,20 @@ func (r *Repository) GetWebhookSecret(ctx context.Context, projectID string) ([]
 
 // UpsertContainer records container metadata for a project.
 func (r *Repository) UpsertContainer(ctx context.Context, container domain.ProjectContainer) error {
-	const query = `INSERT INTO project_containers (project_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+	const query = `INSERT INTO project_containers (project_id, deployment_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
 		ON CONFLICT (container_id) DO UPDATE SET
-			status = EXCLUDED.status,
-			cpu_percent = EXCLUDED.cpu_percent,
-			memory_bytes = EXCLUDED.memory_bytes,
-			uptime_seconds = EXCLUDED.uptime_seconds,
-			host_ip = EXCLUDED.host_ip,
-			host_port = EXCLUDED.host_port,
+				deployment_id = EXCLUDED.deployment_id,
+				status = EXCLUDED.status,
+				cpu_percent = EXCLUDED.cpu_percent,
+				memory_bytes = EXCLUDED.memory_bytes,
+				uptime_seconds = EXCLUDED.uptime_seconds,
+				host_ip = EXCLUDED.host_ip,
+				host_port = EXCLUDED.host_port,
 			updated_at = NOW()`
 	_, err := r.pool.Exec(ctx, query,
 		container.ProjectID,
+		emptyToNil(container.DeploymentID),
 		container.ContainerID,
 		container.Status,
 		floatPtrToNil(container.CPUPercent),
@@ -373,9 +440,16 @@ func (r *Repository) DeleteContainer(ctx context.Context, containerID string) er
 	return err
 }
 
+// DeleteContainersByDeployment removes all containers associated with a deployment.
+func (r *Repository) DeleteContainersByDeployment(ctx context.Context, deploymentID string) error {
+	const query = `DELETE FROM project_containers WHERE deployment_id = $1`
+	_, err := r.pool.Exec(ctx, query, deploymentID)
+	return err
+}
+
 // ListProjectContainers returns containers associated with a project.
 func (r *Repository) ListProjectContainers(ctx context.Context, projectID string) ([]domain.ProjectContainer, error) {
-	const query = `SELECT id, project_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, created_at, updated_at
+	const query = `SELECT id, project_id, deployment_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, created_at, updated_at
 		FROM project_containers WHERE project_id = $1 ORDER BY created_at DESC`
 	rows, err := r.pool.Query(ctx, query, projectID)
 	if err != nil {
@@ -393,7 +467,7 @@ func (r *Repository) ListProjectContainers(ctx context.Context, projectID string
 			hostIP   sql.NullString
 			hostPort sql.NullInt64
 		)
-		if err := rows.Scan(&c.ID, &c.ProjectID, &c.ContainerID, &c.Status, &cpu, &mem, &uptime, &hostIP, &hostPort, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.ProjectID, &c.DeploymentID, &c.ContainerID, &c.Status, &cpu, &mem, &uptime, &hostIP, &hostPort, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if cpu.Valid {
@@ -421,7 +495,7 @@ func (r *Repository) ListProjectContainers(ctx context.Context, projectID string
 
 // ListContainers returns all tracked containers.
 func (r *Repository) ListContainers(ctx context.Context) ([]domain.ProjectContainer, error) {
-	const query = `SELECT id, project_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, created_at, updated_at FROM project_containers`
+	const query = `SELECT id, project_id, deployment_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, created_at, updated_at FROM project_containers`
 	rows, err := r.pool.Query(ctx, query)
 	if err != nil {
 		return nil, err
@@ -438,7 +512,7 @@ func (r *Repository) ListContainers(ctx context.Context) ([]domain.ProjectContai
 			hostIP   sql.NullString
 			hostPort sql.NullInt64
 		)
-		if err := rows.Scan(&c.ID, &c.ProjectID, &c.ContainerID, &c.Status, &cpu, &mem, &uptime, &hostIP, &hostPort, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.ProjectID, &c.DeploymentID, &c.ContainerID, &c.Status, &cpu, &mem, &uptime, &hostIP, &hostPort, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if cpu.Valid {

@@ -246,8 +246,7 @@ func renderNodeDockerfile(flavor string, pm nodePackageManager, includeScript bo
 	}
 	b.WriteString("COPY . ./\n")
 	if includeScript {
-		b.WriteString("RUN if [ -f " + runtimeBuildScriptPath + " ]; then \\\n")
-		b.WriteString("  chmod +x " + runtimeBuildScriptPath + " && bash " + runtimeBuildScriptPath + " && rm -f " + runtimeBuildScriptPath + "; fi\n")
+		appendRuntimeHook(&b)
 	}
 	b.WriteString("ENV NODE_ENV=production\n")
 	if flavor == runtimeNext {
@@ -289,8 +288,7 @@ func renderGoDockerfile(includeScript bool) string {
 	b.WriteString("RUN go mod download\n\n")
 	b.WriteString("COPY . ./\n")
 	if includeScript {
-		b.WriteString("RUN if [ -f " + runtimeBuildScriptPath + " ]; then \\\n")
-		b.WriteString("  chmod +x " + runtimeBuildScriptPath + " && bash " + runtimeBuildScriptPath + " && rm -f " + runtimeBuildScriptPath + "; fi\n")
+		appendRuntimeHook(&b)
 	}
 	b.WriteString("RUN CGO_ENABLED=0 GOOS=linux go build -o /out/app ./...\n\n")
 	b.WriteString("FROM debian:bookworm-slim\n")
@@ -335,8 +333,7 @@ func renderJavaDockerfile(tool javaBuildTool, includeScript bool) string {
 		b.WriteString("WORKDIR /workspace\n\n")
 		b.WriteString("COPY . ./\n")
 		if includeScript {
-			b.WriteString("RUN if [ -f " + runtimeBuildScriptPath + " ]; then \\\n")
-			b.WriteString("  chmod +x " + runtimeBuildScriptPath + " && bash " + runtimeBuildScriptPath + " && rm -f " + runtimeBuildScriptPath + "; fi\n")
+			appendRuntimeHook(&b)
 		}
 		b.WriteString("RUN gradle clean build -x test --no-daemon\n")
 		b.WriteString("RUN JAR=$(find build/libs -name \"*.jar\" -type f | head -n 1) && cp \"$JAR\" /workspace/app.jar\n\n")
@@ -347,8 +344,7 @@ func renderJavaDockerfile(tool javaBuildTool, includeScript bool) string {
 		b.WriteString("RUN mvn -B dependency:go-offline\n\n")
 		b.WriteString("COPY . ./\n")
 		if includeScript {
-			b.WriteString("RUN if [ -f " + runtimeBuildScriptPath + " ]; then \\\n")
-			b.WriteString("  chmod +x " + runtimeBuildScriptPath + " && bash " + runtimeBuildScriptPath + " && rm -f " + runtimeBuildScriptPath + "; fi\n")
+			appendRuntimeHook(&b)
 		}
 		b.WriteString("RUN mvn -B package -DskipTests\n")
 		b.WriteString("RUN JAR=$(ls -1 target/*.jar | head -n 1) && cp \"$JAR\" /workspace/app.jar\n\n")
@@ -394,13 +390,25 @@ func renderRubyDockerfile(includeScript bool) string {
 	b.WriteString("RUN gem install bundler && bundle install --jobs 4 --retry 3\n\n")
 	b.WriteString("COPY . ./\n")
 	if includeScript {
-		b.WriteString("RUN if [ -f " + runtimeBuildScriptPath + " ]; then \\\n")
-		b.WriteString("  chmod +x " + runtimeBuildScriptPath + " && bash " + runtimeBuildScriptPath + " && rm -f " + runtimeBuildScriptPath + "; fi\n")
+		appendRuntimeHook(&b)
 	}
 	b.WriteString("ENV PORT=3000\n")
 	b.WriteString("EXPOSE 3000\n")
 	b.WriteString("CMD [\"bundle\",\"exec\",\"puma\",\"-b\",\"tcp://0.0.0.0:3000\"]\n")
 	return b.String()
+}
+
+// appendRuntimeHook writes the optional build hook invocation that tolerates script errors.
+func appendRuntimeHook(b *strings.Builder) {
+	b.WriteString("RUN if [ -f " + runtimeBuildScriptPath + " ]; then \\\n")
+	b.WriteString("  chmod +x " + runtimeBuildScriptPath + " || true; \\\n")
+	b.WriteString("  bash " + runtimeBuildScriptPath + "; \\\n")
+	b.WriteString("  code=$?; \\\n")
+	b.WriteString("  rm -f " + runtimeBuildScriptPath + " || true; \\\n")
+	b.WriteString("  if [ \"$code\" -ne 0 ]; then \\\n")
+	b.WriteString("    echo \"peep build script exited with $code (ignored)\"; \\\n")
+	b.WriteString("  fi; \\\n")
+	b.WriteString("fi; true\n")
 }
 
 func writeRuntimeBuildScript(workdir, buildCommand string) error {

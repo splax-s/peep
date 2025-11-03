@@ -3,6 +3,7 @@ package team
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"log/slog"
@@ -100,4 +101,16 @@ func (s Service) UpsertMember(ctx context.Context, teamID, userID, role string) 
 		CreatedAt: time.Now().UTC(),
 	}
 	return s.repo.UpsertMember(ctx, member)
+}
+
+// ListByUser returns teams the user is a member of.
+func (s Service) ListByUser(ctx context.Context, userID string) ([]domain.Team, error) {
+	if strings.TrimSpace(userID) == "" {
+		return nil, errors.New("user id required")
+	}
+	teams, err := s.repo.ListTeamsByUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return teams, nil
 }

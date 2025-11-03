@@ -175,53 +175,85 @@ func (r *Router) handleLogin(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Router) handleTeams(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
+	switch req.Method {
+	case http.MethodPost:
+		var payload struct {
+			Name   string      `json:"name"`
+			Limits team.Limits `json:"limits"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		info, ok := authInfoFromContext(req.Context())
+		if !ok {
+			r.logger.Error("auth context missing for team creation", "path", req.URL.Path)
+			writeError(w, http.StatusInternalServerError, "authorization context missing")
+			return
+		}
+		team, err := r.team.Create(req.Context(), info.UserID, payload.Name, payload.Limits)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, team)
+	case http.MethodGet:
+		info, ok := authInfoFromContext(req.Context())
+		if !ok {
+			r.logger.Error("auth context missing for team list", "path", req.URL.Path)
+			writeError(w, http.StatusInternalServerError, "authorization context missing")
+			return
+		}
+		teams, err := r.team.ListByUser(req.Context(), info.UserID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, teams)
+	default:
 		r.methodNotAllowed(w)
-		return
 	}
-	var payload struct {
-		Name   string      `json:"name"`
-		Limits team.Limits `json:"limits"`
-	}
-	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	info, ok := authInfoFromContext(req.Context())
-	if !ok {
-		r.logger.Error("auth context missing for team creation", "path", req.URL.Path)
-		writeError(w, http.StatusInternalServerError, "authorization context missing")
-		return
-	}
-	team, err := r.team.Create(req.Context(), info.UserID, payload.Name, payload.Limits)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusCreated, team)
 }
 
 func (r *Router) handleProjects(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
+	switch req.Method {
+	case http.MethodPost:
+		var payload project.CreateInput
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if _, ok := authInfoFromContext(req.Context()); !ok {
+			r.logger.Error("auth context missing for project creation", "path", req.URL.Path)
+			writeError(w, http.StatusInternalServerError, "authorization context missing")
+			return
+		}
+		proj, err := r.project.Create(req.Context(), payload)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, proj)
+	case http.MethodGet:
+		if _, ok := authInfoFromContext(req.Context()); !ok {
+			r.logger.Error("auth context missing for project list", "path", req.URL.Path)
+			writeError(w, http.StatusInternalServerError, "authorization context missing")
+			return
+		}
+		teamID := strings.TrimSpace(req.URL.Query().Get("team_id"))
+		if teamID == "" {
+			writeError(w, http.StatusBadRequest, "team_id query parameter required")
+			return
+		}
+		projects, err := r.project.ListByTeam(req.Context(), teamID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, projects)
+	default:
 		r.methodNotAllowed(w)
-		return
 	}
-	var payload project.CreateInput
-	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	if _, ok := authInfoFromContext(req.Context()); !ok {
-		r.logger.Error("auth context missing for project creation", "path", req.URL.Path)
-		writeError(w, http.StatusInternalServerError, "authorization context missing")
-		return
-	}
-	proj, err := r.project.Create(req.Context(), payload)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusCreated, proj)
 }
 
 func (r *Router) handleProjectSubroutes(w http.ResponseWriter, req *http.Request) {
@@ -236,6 +268,10 @@ func (r *Router) handleProjectSubroutes(w http.ResponseWriter, req *http.Request
 		r.notFound(w)
 		return
 	}
+	if len(parts) == 1 {
+		r.handleProjectResource(w, req, projectID)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "env" {
 		r.handleProjectEnv(w, req, projectID)
 		return
@@ -243,27 +279,63 @@ func (r *Router) handleProjectSubroutes(w http.ResponseWriter, req *http.Request
 	r.notFound(w)
 }
 
-func (r *Router) handleProjectEnv(w http.ResponseWriter, req *http.Request, projectID string) {
-	if req.Method != http.MethodPost {
+func (r *Router) handleProjectResource(w http.ResponseWriter, req *http.Request, projectID string) {
+	switch req.Method {
+	case http.MethodGet:
+		if _, ok := authInfoFromContext(req.Context()); !ok {
+			r.logger.Error("auth context missing for project detail", "path", req.URL.Path)
+			writeError(w, http.StatusInternalServerError, "authorization context missing")
+			return
+		}
+		proj, err := r.project.Get(req.Context(), projectID)
+		if err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				writeError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, proj)
+	default:
 		r.methodNotAllowed(w)
-		return
 	}
-	var payload project.EnvVarInput
-	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
+}
+
+func (r *Router) handleProjectEnv(w http.ResponseWriter, req *http.Request, projectID string) {
+	switch req.Method {
+	case http.MethodPost:
+		var payload project.EnvVarInput
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if _, ok := authInfoFromContext(req.Context()); !ok {
+			r.logger.Error("auth context missing for env var mutation", "path", req.URL.Path)
+			writeError(w, http.StatusInternalServerError, "authorization context missing")
+			return
+		}
+		payload.ProjectID = projectID
+		if err := r.project.AddEnvVar(req.Context(), payload); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]string{"status": "stored"})
+	case http.MethodGet:
+		if _, ok := authInfoFromContext(req.Context()); !ok {
+			r.logger.Error("auth context missing for env var list", "path", req.URL.Path)
+			writeError(w, http.StatusInternalServerError, "authorization context missing")
+			return
+		}
+		vars, err := r.project.ListEnvVars(req.Context(), projectID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, vars)
+	default:
+		r.methodNotAllowed(w)
 	}
-	if _, ok := authInfoFromContext(req.Context()); !ok {
-		r.logger.Error("auth context missing for env var mutation", "path", req.URL.Path)
-		writeError(w, http.StatusInternalServerError, "authorization context missing")
-		return
-	}
-	payload.ProjectID = projectID
-	if err := r.project.AddEnvVar(req.Context(), payload); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusCreated, map[string]string{"status": "stored"})
 }
 
 func (r *Router) handleDeploy(w http.ResponseWriter, req *http.Request) {

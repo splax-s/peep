@@ -1,0 +1,29 @@
+{
+  "name": "peep-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --hostname 0.0.0.0 --port 8081",
+    "build": "next build",
+    "start": "next start --hostname 0.0.0.0 --port 8081",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "16.0.1",
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3",
+    "@tailwindcss/forms": "0.5.7",
+    "autoprefixer": "10.4.19",
+    "postcss": "8.4.47",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+  "eslint-config-next": "16.0.1",
+    "tailwindcss": "3.4.13",
+    "typescript": "^5"
+  }
+}

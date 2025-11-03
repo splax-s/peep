@@ -20,6 +20,7 @@ type TeamRepository interface {
 	UpsertMember(ctx context.Context, member *domain.TeamMember) error
 	CountProjects(ctx context.Context, teamID string) (int, error)
 	GetTeamByID(ctx context.Context, teamID string) (*domain.Team, error)
+	ListTeamsByUser(ctx context.Context, userID string) ([]domain.Team, error)
 }
 
 // ProjectRepository persists project configuration.
@@ -27,12 +28,15 @@ type ProjectRepository interface {
 	CreateProject(ctx context.Context, project *domain.Project) error
 	UpsertEnvVar(ctx context.Context, envVar *domain.ProjectEnvVar) error
 	GetProjectByID(ctx context.Context, projectID string) (*domain.Project, error)
+	ListProjectsByTeam(ctx context.Context, teamID string) ([]domain.Project, error)
+	ListProjectEnvVars(ctx context.Context, projectID string) ([]domain.ProjectEnvVar, error)
 }
 
 // ContainerRepository stores running container metadata.
 type ContainerRepository interface {
 	UpsertContainer(ctx context.Context, container domain.ProjectContainer) error
 	DeleteContainer(ctx context.Context, containerID string) error
+	DeleteContainersByDeployment(ctx context.Context, deploymentID string) error
 	ListProjectContainers(ctx context.Context, projectID string) ([]domain.ProjectContainer, error)
 	RemoveStaleContainers(ctx context.Context, projectID, activeContainerID string) error
 	ListContainers(ctx context.Context) ([]domain.ProjectContainer, error)

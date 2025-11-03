@@ -26,6 +26,7 @@ type ProjectEnvVar struct {
 type ProjectContainer struct {
 	ID            string
 	ProjectID     string
+	DeploymentID  string
 	ContainerID   string
 	Status        string
 	HostIP        string

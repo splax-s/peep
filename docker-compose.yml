@@ -41,6 +41,8 @@ services:
       INGRESS_DOMAIN_SUFFIX: .local.peep
       NGINX_CONTAINER_NAME: peep-nginx
       DOCKER_HOST: unix:///var/run/docker.sock
+      RUNTIME_DEPLOYMENT_TTL_SECONDS: "60"
+      RUNTIME_CONTAINER_TTL_SECONDS: "60"
     volumes:
       - ./:/workspace
       - /var/run/docker.sock:/var/run/docker.sock
@@ -85,6 +87,26 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  dashboard:
+    image: node:20-alpine
+    working_dir: /workspace/dashboard
+    command: sh -c "npm install && npm run dev"
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://api:4000
+      NEXT_TELEMETRY_DISABLED: "1"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    volumes:
+      - ./:/workspace
+    ports:
+      - "8081:8081"
+    depends_on:
+      api:
+        condition: service_started
 
   nginx:
     image: nginx:1.27-alpine

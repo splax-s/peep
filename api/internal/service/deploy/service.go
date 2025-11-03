@@ -164,7 +164,7 @@ func (s Service) DeleteDeployment(ctx context.Context, deploymentID string) erro
 		s.logger.Warn("builder cancellation failed", "deployment_id", id, "error", err)
 	}
 	projectID := deployment.ProjectID
-	if err := s.cleanupContainers(ctx, projectID); err != nil {
+	if err := s.cleanupContainers(ctx, projectID, id); err != nil {
 		s.logger.Warn("container cleanup failed", "project_id", projectID, "deployment_id", id, "error", err)
 	}
 	if err := s.removeIngress(ctx, projectID); err != nil {
@@ -197,9 +197,14 @@ func (s Service) cancelBuilderDeployment(ctx context.Context, deploymentID strin
 	return nil
 }
 
-func (s Service) cleanupContainers(ctx context.Context, projectID string) error {
+func (s Service) cleanupContainers(ctx context.Context, projectID, deploymentID string) error {
 	if s.containers == nil {
 		return nil
+	}
+	if strings.TrimSpace(deploymentID) != "" {
+		if err := s.containers.DeleteContainersByDeployment(ctx, deploymentID); err != nil {
+			return err
+		}
 	}
 	containers, err := s.containers.ListProjectContainers(ctx, projectID)
 	if err != nil {
@@ -207,6 +212,9 @@ func (s Service) cleanupContainers(ctx context.Context, projectID string) error 
 	}
 	var firstErr error
 	for _, container := range containers {
+		if strings.TrimSpace(deploymentID) != "" && strings.TrimSpace(container.DeploymentID) == strings.TrimSpace(deploymentID) {
+			continue
+		}
 		if err := s.containers.DeleteContainer(ctx, container.ContainerID); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -494,10 +502,11 @@ func (s Service) handleIngress(ctx context.Context, payload CallbackPayload, met
 	hostIP = strings.TrimSpace(hostIP)
 
 	container := domain.ProjectContainer{
-		ProjectID:   projectID,
-		ContainerID: containerID,
-		Status:      status,
-		UpdatedAt:   time.Now().UTC(),
+		ProjectID:    projectID,
+		DeploymentID: payload.DeploymentID,
+		ContainerID:  containerID,
+		Status:       status,
+		UpdatedAt:    time.Now().UTC(),
 	}
 	if hostIP != "" {
 		container.HostIP = hostIP

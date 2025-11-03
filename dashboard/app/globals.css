@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  scrollbar-width: thin;
+}
+
+body {
+  @apply bg-slate-950 text-slate-100 min-h-screen font-sans;
+  background-image: theme('backgroundImage.radial-dusk');
+}
+
+.glass-card {
+  @apply rounded-2xl border border-white/10 bg-slate-900/70 backdrop-blur-xl shadow-glow;
+}
+
+.section-heading {
+  @apply text-lg font-semibold text-slate-100;
+}
+
+.muted {
+  @apply text-sm text-slate-400;
+}
+
+.badge {
+  @apply inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-xs font-medium text-slate-200;
+}

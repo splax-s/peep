@@ -136,11 +136,18 @@ func (fakeProjectRepo) UpsertEnvVar(context.Context, *domain.ProjectEnvVar) erro
 func (fakeProjectRepo) GetProjectByID(ctx context.Context, projectID string) (*domain.Project, error) {
 	return &domain.Project{ID: projectID, Name: "test", RepoURL: "https://example.com"}, nil
 }
+func (fakeProjectRepo) ListProjectsByTeam(context.Context, string) ([]domain.Project, error) {
+	return nil, nil
+}
+func (fakeProjectRepo) ListProjectEnvVars(context.Context, string) ([]domain.ProjectEnvVar, error) {
+	return nil, nil
+}
 
 type fakeContainerRepo struct{}
 
 func (fakeContainerRepo) UpsertContainer(context.Context, domain.ProjectContainer) error { return nil }
 func (fakeContainerRepo) DeleteContainer(context.Context, string) error                  { return nil }
+func (fakeContainerRepo) DeleteContainersByDeployment(context.Context, string) error     { return nil }
 func (fakeContainerRepo) ListProjectContainers(context.Context, string) ([]domain.ProjectContainer, error) {
 	return nil, nil
 }

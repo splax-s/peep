@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/splax/localvercel/api/internal/domain"
@@ -30,6 +32,9 @@ type Controller struct {
 	deployments repository.DeploymentRepository
 	ingress     IngressApplier
 	logger      *slog.Logger
+	builder     *http.Client
+	builderURL  string
+	builderTok  string
 
 	interval         time.Duration
 	containerTTL     time.Duration
@@ -60,6 +65,12 @@ func New(projects repository.ProjectRepository, containers repository.ContainerR
 		return nil
 	}
 
+	var builderClient *http.Client
+	builderURL := strings.TrimSpace(cfg.BuilderURL)
+	if builderURL != "" {
+		builderClient = &http.Client{Timeout: 10 * time.Second}
+	}
+
 	ctrl := &Controller{
 		projects:         projects,
 		containers:       containers,
@@ -72,6 +83,9 @@ func New(projects repository.ProjectRepository, containers repository.ContainerR
 		cpuLimit:         cpuLimit,
 		memoryLimitBytes: memoryLimit,
 		now:              time.Now,
+		builder:          builderClient,
+		builderURL:       builderURL,
+		builderTok:       strings.TrimSpace(cfg.BuilderAuthToken),
 	}
 
 	if ctrl.logger != nil {
@@ -147,7 +161,7 @@ func (c *Controller) handleContainers(ctx context.Context, now time.Time, contai
 			continue
 		}
 		if c.containerTTL > 0 && container.UpdatedAt.Before(cutoff) {
-			if c.removeContainer(ctx, container, "expired", formatDuration(c.containerTTL)) {
+			if c.removeContainer(ctx, container, "expired", fmt.Sprintf("container exceeded ttl %s", formatDuration(c.containerTTL))) {
 				removed[container.ContainerID] = struct{}{}
 				touched[container.ProjectID] = struct{}{}
 			}
@@ -185,19 +199,11 @@ func (c *Controller) handleDeployments(ctx context.Context, now time.Time) map[s
 	}
 	for _, dep := range deployments {
 		msg := fmt.Sprintf("deployment timed out after %s", formatDuration(c.deploymentTTL))
-		completedAt := now
-		update := domain.DeploymentStatusUpdate{
-			DeploymentID: dep.ID,
-			Status:       deploy.StatusFailed,
-			Stage:        runtimeTimeoutStage,
-			Message:      msg,
-			Error:        msg,
-			CompletedAt:  &completedAt,
+		c.cancelDeployment(ctx, dep.ID)
+		if err := c.containers.DeleteContainersByDeployment(ctx, dep.ID); err != nil {
+			c.logger.Warn("failed to remove containers for timed out deployment", "deployment_id", dep.ID, "error", err)
 		}
-		if err := c.deployments.UpdateDeploymentStatus(ctx, update); err != nil {
-			c.logger.Warn("failed to timeout deployment", "deployment_id", dep.ID, "error", err)
-			continue
-		}
+		c.failDeployment(ctx, dep.ProjectID, dep.ID, runtimeTimeoutStage, msg)
 		touched[dep.ProjectID] = struct{}{}
 		c.logger.Info("deployment marked failed after runtime timeout", "deployment_id", dep.ID, "project_id", dep.ProjectID)
 	}
@@ -227,8 +233,77 @@ func (c *Controller) removeContainer(ctx context.Context, container domain.Proje
 		c.logger.Warn("failed to deregister container", "project_id", container.ProjectID, "container_id", container.ContainerID, "reason", reason, "error", err)
 		return false
 	}
+	deploymentID := strings.TrimSpace(container.DeploymentID)
+	if deploymentID != "" {
+		c.cancelDeployment(ctx, deploymentID)
+		if err := c.containers.DeleteContainersByDeployment(ctx, deploymentID); err != nil {
+			c.logger.Warn("failed to cleanup deployment containers", "project_id", container.ProjectID, "deployment_id", deploymentID, "error", err)
+		}
+		stage := "runtime_" + reason
+		if detail == "" {
+			detail = reason
+		}
+		c.failDeployment(ctx, container.ProjectID, deploymentID, stage, detail)
+	}
 	c.logger.Info("container deregistered", "project_id", container.ProjectID, "container_id", container.ContainerID, "reason", reason, "detail", detail)
 	return true
+}
+
+func (c *Controller) failDeployment(ctx context.Context, projectID, deploymentID, stage, message string) {
+	if strings.TrimSpace(deploymentID) == "" {
+		return
+	}
+	completedAt := c.now()
+	update := domain.DeploymentStatusUpdate{
+		DeploymentID: deploymentID,
+		Status:       deploy.StatusFailed,
+		Stage:        stage,
+		Message:      message,
+		Error:        message,
+		CompletedAt:  &completedAt,
+	}
+	if err := c.deployments.UpdateDeploymentStatus(ctx, update); err != nil {
+		c.logger.Warn("failed to mark deployment failed", "deployment_id", deploymentID, "project_id", projectID, "stage", stage, "error", err)
+	}
+}
+
+func (c *Controller) cancelDeployment(ctx context.Context, deploymentID string) {
+	if c.builder == nil || strings.TrimSpace(deploymentID) == "" {
+		return
+	}
+	endpoint := c.builderEndpoint("/deploy/" + strings.TrimSpace(deploymentID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		c.logger.Warn("failed to build builder cancel request", "deployment_id", deploymentID, "error", err)
+		return
+	}
+	if c.builderTok != "" {
+		req.Header.Set("X-Builder-Token", c.builderTok)
+	}
+	resp, err := c.builder.Do(req)
+	if err != nil {
+		c.logger.Warn("builder cancel request failed", "deployment_id", deploymentID, "error", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		c.logger.Warn("builder cancel returned error", "deployment_id", deploymentID, "status", resp.Status)
+	}
+}
+
+func (c *Controller) builderEndpoint(path string) string {
+	base := strings.TrimSpace(c.builderURL)
+	if base == "" {
+		if strings.HasPrefix(path, "/") {
+			return path
+		}
+		return "/" + path
+	}
+	base = strings.TrimSuffix(base, "/")
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return base + path
 }
 
 func formatDuration(d time.Duration) string {
