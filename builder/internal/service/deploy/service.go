@@ -25,6 +25,7 @@ import (
 	"github.com/splax/localvercel/builder/internal/git"
 	"github.com/splax/localvercel/builder/internal/workspace"
 	"github.com/splax/localvercel/pkg/config"
+	"github.com/splax/localvercel/pkg/runtime/telemetry"
 )
 
 const (
@@ -50,16 +51,23 @@ type Result struct {
 	Timestamp    time.Time `json:"timestamp"`
 }
 
+// TelemetryEmitter publishes runtime telemetry events to the API.
+type TelemetryEmitter interface {
+	Emit(ctx context.Context, event telemetry.Event) error
+}
+
 // Service coordinates build and run operations using Docker.
 type Service struct {
-	docker          *docker.Client
-	workspace       *workspace.Manager
-	logger          *slog.Logger
-	cfg             config.BuilderConfig
-	statusClient    *http.Client
-	logClient       *http.Client
-	callbackTimeout time.Duration
-	logSuppressed   *sync.Map
+	docker           *docker.Client
+	workspace        *workspace.Manager
+	logger           *slog.Logger
+	cfg              config.BuilderConfig
+	statusClient     *http.Client
+	logClient        *http.Client
+	callbackTimeout  time.Duration
+	logSuppressed    *sync.Map
+	telemetry        TelemetryEmitter
+	telemetryTimeout time.Duration
 }
 
 type suppressionEntry struct {
@@ -123,7 +131,7 @@ func (s Service) attachBuilderToken(req *http.Request) {
 }
 
 // New creates a deployment service.
-func New(cli *docker.Client, ws *workspace.Manager, logger *slog.Logger, cfg config.BuilderConfig) Service {
+func New(cli *docker.Client, ws *workspace.Manager, logger *slog.Logger, cfg config.BuilderConfig, telemetryEmitter TelemetryEmitter) Service {
 	timeout := cfg.DeployCallbackTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -136,15 +144,21 @@ func New(cli *docker.Client, ws *workspace.Manager, logger *slog.Logger, cfg con
 	if cfg.LogCallbackURL != "" {
 		logClient = &http.Client{Timeout: timeout}
 	}
+	telemetryTimeout := cfg.RuntimeTelemetryTimeout
+	if telemetryTimeout <= 0 {
+		telemetryTimeout = 5 * time.Second
+	}
 	return Service{
-		docker:          cli,
-		workspace:       ws,
-		logger:          logger,
-		cfg:             cfg,
-		statusClient:    statusClient,
-		logClient:       logClient,
-		callbackTimeout: timeout,
-		logSuppressed:   &sync.Map{},
+		docker:           cli,
+		workspace:        ws,
+		logger:           logger,
+		cfg:              cfg,
+		statusClient:     statusClient,
+		logClient:        logClient,
+		callbackTimeout:  timeout,
+		logSuppressed:    &sync.Map{},
+		telemetry:        telemetryEmitter,
+		telemetryTimeout: telemetryTimeout,
 	}
 }
 
@@ -169,6 +183,11 @@ func (s Service) Handle(ctx context.Context, req Request) (Result, error) {
 
 	imageTag := s.imageTag(req)
 	_ = s.notifyStatus(req, "queued", "queued", "deployment queued", imageTag, "", map[string]any{"deployment_id": req.DeploymentID}, nil)
+	s.emitRuntimeEvent(ctx, req, "deployment_queued", "info", "deployment queued", map[string]any{
+		"deployment_id": req.DeploymentID,
+		"project_id":    req.ProjectID,
+		"image":         imageTag,
+	})
 
 	go s.execute(context.Background(), req, imageTag)
 
@@ -226,6 +245,10 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 	defer cancel()
 
 	_ = s.notifyStatus(req, "building", "workspace", "preparing workspace", imageTag, "", map[string]any{"deployment_id": req.DeploymentID}, nil)
+	s.emitRuntimeEvent(ctx, req, "workspace_prepare_started", "info", "preparing workspace", map[string]any{
+		"deployment_id": req.DeploymentID,
+		"project_id":    req.ProjectID,
+	})
 	s.emitLog(req, "info", "preparing workspace", map[string]any{"deployment_id": req.DeploymentID})
 
 	workdir, err := s.workspace.Prepare(req.DeploymentID)
@@ -240,12 +263,22 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 	}()
 
 	_ = s.notifyStatus(req, "building", "clone", "cloning repository", imageTag, "", nil, nil)
+	s.emitRuntimeEvent(ctx, req, "repository_clone_started", "info", "cloning repository", map[string]any{
+		"deployment_id": req.DeploymentID,
+		"project_id":    req.ProjectID,
+		"repo_url":      req.RepoURL,
+	})
 	gitCtx, cancelGit := context.WithTimeout(ctx, s.cfg.GitTimeout)
 	defer cancelGit()
 	if err := git.Clone(gitCtx, req.RepoURL, workdir); err != nil {
 		s.fail(req, imageTag, "clone", err)
 		return
 	}
+	s.emitRuntimeEvent(ctx, req, "repository_cloned", "info", "repository cloned", map[string]any{
+		"deployment_id": req.DeploymentID,
+		"project_id":    req.ProjectID,
+		"repo_url":      req.RepoURL,
+	})
 	s.emitLog(req, "info", "repository cloned", map[string]any{"repo_url": req.RepoURL})
 
 	if err := ensureBuildContext(workdir); err != nil {
@@ -273,7 +306,10 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		if runtimePrep.BuildTool != "" {
 			meta["build_tool"] = runtimePrep.BuildTool
 		}
+		meta["deployment_id"] = req.DeploymentID
+		meta["project_id"] = req.ProjectID
 		s.emitLog(req, "info", "runtime prepared", meta)
+		s.emitRuntimeEvent(ctx, req, "runtime_prepared", "info", "runtime prepared", meta)
 	}
 
 	buildCommand := strings.TrimSpace(req.BuildCommand)
@@ -282,7 +318,31 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 	}
 
 	if buildCommand != "" {
+		executable, err := commandExecutable(buildCommand)
+		if err != nil {
+			s.fail(req, imageTag, "build", err)
+			return
+		}
+		if executable == "" {
+			buildCommand = ""
+		} else {
+			if _, err := exec.LookPath(executable); err != nil {
+				s.logger.Info("skipping host build command; executable not available", "deployment_id", req.DeploymentID, "command", executable)
+				s.emitLog(req, "info", "skipping host build command; executable not available", map[string]any{
+					"command": executable,
+				})
+				buildCommand = ""
+			}
+		}
+	}
+
+	if buildCommand != "" {
 		_ = s.notifyStatus(req, "building", "build", "running build command", imageTag, "", nil, nil)
+		s.emitRuntimeEvent(ctx, req, "build_command_started", "info", "running build command", map[string]any{
+			"deployment_id": req.DeploymentID,
+			"project_id":    req.ProjectID,
+			"command":       buildCommand,
+		})
 		output, err := runCommand(ctx, buildCommand, workdir, s.logger.With("deployment_id", req.DeploymentID, "stage", "build"))
 		if err != nil {
 			s.fail(req, imageTag, "build", err)
@@ -294,6 +354,11 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		if output != "" {
 			s.emitLog(req, "info", "build command output", map[string]any{"output": truncateForMetadata(output)})
 		}
+		s.emitRuntimeEvent(ctx, req, "build_command_completed", "info", "build command completed", map[string]any{
+			"deployment_id": req.DeploymentID,
+			"project_id":    req.ProjectID,
+			"command":       buildCommand,
+		})
 	}
 
 	if err := ensureDockerfile(workdir); err != nil {
@@ -302,7 +367,25 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		return
 	}
 
+	runCommand := strings.TrimSpace(req.RunCommand)
+	if runCommand != "" && !runtimePrep.DockerfileGenerated {
+		s.emitLog(req, "info", "ignoring run command; repository Dockerfile defines entrypoint", map[string]any{
+			"requested_command": runCommand,
+		})
+		s.emitRuntimeEvent(ctx, req, "run_command_ignored", "info", "ignoring run command because Dockerfile defines entrypoint", map[string]any{
+			"deployment_id":     req.DeploymentID,
+			"project_id":        req.ProjectID,
+			"requested_command": runCommand,
+		})
+		runCommand = ""
+	}
+
 	_ = s.notifyStatus(req, "building", "docker_build", "building container image", imageTag, "", nil, nil)
+	s.emitRuntimeEvent(ctx, req, "docker_build_started", "info", "building container image", map[string]any{
+		"deployment_id": req.DeploymentID,
+		"project_id":    req.ProjectID,
+		"image":         imageTag,
+	})
 	aggregator := newBuildLogAggregator(func(msg string) {
 		s.logger.Debug("docker build output", "deployment_id", req.DeploymentID, "line", msg)
 		s.emitLog(req, "info", "docker build output", map[string]any{
@@ -339,12 +422,17 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		})
 	}
 	s.emitLog(req, "info", "docker image built", map[string]any{"image": imageTag})
+	s.emitRuntimeEvent(ctx, req, "docker_build_completed", "info", "docker image built", map[string]any{
+		"deployment_id": req.DeploymentID,
+		"project_id":    req.ProjectID,
+		"image":         imageTag,
+	})
 
 	if err := s.docker.RemoveContainer(ctx, req.DeploymentID); err != nil {
 		s.logger.Warn("remove existing container failed", "deployment_id", req.DeploymentID, "error", err)
 	}
 
-	cmd, err := parseCommand(req.RunCommand)
+	cmd, err := parseCommand(runCommand)
 	if err != nil {
 		s.fail(req, imageTag, "run_command", err)
 		return
@@ -355,6 +443,11 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 	}
 
 	_ = s.notifyStatus(req, "starting", "container", "starting container", imageTag, "", nil, nil)
+	s.emitRuntimeEvent(ctx, req, "container_starting", "info", "starting container", map[string]any{
+		"deployment_id": req.DeploymentID,
+		"project_id":    req.ProjectID,
+		"image":         imageTag,
+	})
 	s.emitLog(req, "info", "starting container", map[string]any{"image": imageTag})
 
 	info, err := s.docker.RunContainer(ctx, req.DeploymentID, imageTag, cmd, nil, ports)
@@ -362,6 +455,12 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		s.fail(req, imageTag, "container_start", err)
 		return
 	}
+	s.emitRuntimeEvent(ctx, req, "container_started", "info", "container started", map[string]any{
+		"deployment_id": req.DeploymentID,
+		"project_id":    req.ProjectID,
+		"container_id":  info.ID,
+		"image":         imageTag,
+	})
 	startedAt := time.Now().UTC()
 
 	url := s.resolveAccessURL(info)
@@ -386,8 +485,14 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 	if len(buildTail) > 0 {
 		readyMeta["build_log_tail"] = buildTail
 	}
+	readyMeta["deployment_id"] = req.DeploymentID
+	readyMeta["project_id"] = req.ProjectID
+	if url != "" {
+		readyMeta["url"] = url
+	}
 	_ = s.notifyStatus(req, "running", "ready", "deployment is running", imageTag, url, readyMeta, nil)
 	s.emitLog(req, "info", "deployment is running", map[string]any{"url": url, "container_id": info.ID})
+	s.emitRuntimeEvent(nil, req, "deployment_ready", "info", "deployment is running", readyMeta)
 	if strings.TrimSpace(info.ID) != "" {
 		go s.watchContainer(req, info.ID, imageTag, hostIP, hostPort, startedAt)
 	}
@@ -399,6 +504,21 @@ func (s Service) imageTag(req Request) string {
 		registry = "local" // deterministic fallback
 	}
 	return filepath.ToSlash(fmt.Sprintf("%s/%s:%s", registry, req.ProjectID, req.DeploymentID))
+}
+
+func commandExecutable(command string) (string, error) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return "", nil
+	}
+	args, err := parseCommand(command)
+	if err != nil {
+		return "", err
+	}
+	if len(args) == 0 {
+		return "", nil
+	}
+	return args[0], nil
 }
 
 func runCommand(ctx context.Context, command, dir string, log *slog.Logger) (string, error) {
@@ -456,6 +576,44 @@ func ensureBuildContext(dir string) error {
 		return fmt.Errorf("build context is empty")
 	}
 	return nil
+}
+
+func (s Service) emitRuntimeEvent(parent context.Context, req Request, eventType, level, message string, metadata map[string]any) {
+	if s.telemetry == nil {
+		return
+	}
+	projectID := strings.TrimSpace(req.ProjectID)
+	if projectID == "" {
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	timeout := s.telemetryTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	event := telemetry.Event{
+		ProjectID:  projectID,
+		Source:     "builder",
+		EventType:  strings.TrimSpace(eventType),
+		Level:      strings.TrimSpace(level),
+		Message:    strings.TrimSpace(message),
+		OccurredAt: time.Now().UTC(),
+	}
+	if len(metadata) > 0 {
+		if payload, err := json.Marshal(metadata); err == nil {
+			event.Metadata = payload
+		} else if s.logger != nil {
+			s.logger.Warn("runtime telemetry metadata marshal failed", "project_id", projectID, "error", err)
+		}
+	}
+	if err := s.telemetry.Emit(ctx, event); err != nil && s.logger != nil {
+		s.logger.Warn("runtime telemetry emit failed", "project_id", projectID, "event_type", eventType, "error", err)
+	}
 }
 
 func truncateForMetadata(s string) string {
@@ -526,6 +684,17 @@ func (s Service) fail(req Request, imageTag, stage string, err error) {
 		"stage": stage,
 		"error": err.Error(),
 	})
+	metadata := map[string]any{
+		"deployment_id": req.DeploymentID,
+		"stage":         stage,
+	}
+	if imageTag != "" {
+		metadata["image"] = imageTag
+	}
+	if err != nil {
+		metadata["error"] = err.Error()
+	}
+	s.emitRuntimeEvent(nil, req, "deployment_failed", "error", fmt.Sprintf("%s failed", stage), metadata)
 }
 
 func (s Service) watchContainer(req Request, containerID, image, hostIP, hostPort string, startedAt time.Time) {
@@ -547,6 +716,11 @@ func (s Service) watchContainer(req Request, containerID, image, hostIP, hostPor
 		_ = s.notifyStatus(req, "failed", "container_exit", "failed to monitor container", image, "", map[string]any{
 			"container_id": containerID,
 		}, err)
+		s.emitRuntimeEvent(nil, req, "container_watch_failed", "error", "failed to monitor container", map[string]any{
+			"deployment_id": req.DeploymentID,
+			"container_id":  containerID,
+			"error":         err.Error(),
+		})
 		return
 	}
 	uptimeSeconds := int64(0)
@@ -583,6 +757,7 @@ func (s Service) watchContainer(req Request, containerID, image, hostIP, hostPor
 		"container_id": containerID,
 		"exit_code":    exitCode,
 	})
+	s.emitRuntimeEvent(nil, req, "container_exit", logLevel, message, metadata)
 	if err := s.docker.RemoveContainer(ctx, containerID); err != nil {
 		s.logger.Warn("post-exit container cleanup failed", "deployment_id", req.DeploymentID, "container_id", containerID, "error", err)
 	}
