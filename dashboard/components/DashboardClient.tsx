@@ -3,15 +3,23 @@
 import {
   useEffect,
   useMemo,
+  useRef,
   useState,
   useTransition,
   type ChangeEvent,
   type FormEvent,
 } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { addEnvVarAction, createProjectAction, createTeamAction } from '@/lib/actions/dashboard';
+import {
+  addEnvVarAction,
+  createProjectAction,
+  createTeamAction,
+  deleteDeploymentAction,
+  triggerDeploymentAction,
+} from '@/lib/actions/dashboard';
 import { logout } from '@/lib/actions/auth';
-import type { Project, ProjectEnvVar, Team } from '@/types';
+import { LOGS_PAGE_SIZE } from '@/lib/dashboard';
+import type { Deployment, Project, ProjectEnvVar, ProjectLog, Team } from '@/types';
 
 interface DashboardClientProps {
   userEmail: string;
@@ -21,6 +29,10 @@ interface DashboardClientProps {
   activeProjectId: string | null;
   project: Project | null;
   envVars: ProjectEnvVar[];
+  deployments: Deployment[];
+  logs: ProjectLog[];
+  logsHasMore: boolean;
+  deploymentsHasMore: boolean;
 }
 
 interface DashboardState {
@@ -31,6 +43,10 @@ interface DashboardState {
   activeProjectId: string | null;
   project: Project | null;
   envVars: ProjectEnvVar[];
+  deployments: Deployment[];
+  logs: ProjectLog[];
+  logsHasMore: boolean;
+  deploymentsHasMore: boolean;
 }
 
 type ToastVariant = 'success' | 'error';
@@ -39,6 +55,24 @@ interface ToastState {
   id: number;
   message: string;
   variant: ToastVariant;
+}
+
+interface StreamLogPayload {
+  project_id: string;
+  source: string;
+  level: string;
+  message: string;
+  metadata: unknown;
+  created_at: string;
+  id?: number;
+}
+
+type LogStreamStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
+
+interface ReconnectState {
+  attempts: number;
+  delay: number;
+  timeoutId: number | null;
 }
 
 class UnauthorizedError extends Error {
@@ -94,15 +128,82 @@ function formatId(value: string | null | undefined, maxLength = 6): string {
   return String(value).slice(0, maxLength);
 }
 
+const timestampFormatter = new Intl.DateTimeFormat(undefined, {
+  year: 'numeric',
+  month: 'short',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+});
+
+function formatTimestamp(value: string | null | undefined): string {
+  if (!value) {
+    return '—';
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return '—';
+  }
+  return timestampFormatter.format(parsed);
+}
+
+const STREAM_RETRY_MIN_DELAY_MS = 2000;
+const STREAM_RETRY_MAX_DELAY_MS = 30000;
+const STREAM_RETRY_ERROR_THRESHOLD = 5;
+
+function normalizeStreamMetadata(metadata: unknown): Record<string, unknown> | null {
+  if (!metadata) {
+    return null;
+  }
+  if (typeof metadata === 'object' && metadata !== null) {
+    return metadata as Record<string, unknown>;
+  }
+  if (typeof metadata === 'string') {
+    try {
+      const parsed = JSON.parse(metadata) as unknown;
+      if (typeof parsed === 'object' && parsed !== null) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function deploymentBadgeClass(status: string): string {
+  const base = 'badge inline-flex items-center rounded-lg border px-2 py-1 text-[11px] font-semibold uppercase tracking-wide';
+  const normalized = status ? status.toLowerCase() : '';
+  switch (normalized) {
+    case 'success':
+    case 'completed':
+    case 'ready':
+      return `${base} border-emerald-500/50 bg-emerald-500/15 text-emerald-200`;
+    case 'error':
+    case 'failed':
+    case 'canceled':
+      return `${base} border-rose-500/50 bg-rose-500/15 text-rose-200`;
+    case 'building':
+    case 'pending':
+    case 'queued':
+      return `${base} border-amber-500/40 bg-amber-500/15 text-amber-200`;
+    default:
+      return `${base} border-slate-500/40 bg-slate-500/10 text-slate-200`;
+  }
+}
+
 export function DashboardClient(props: DashboardClientProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
+
   const [navigationPending, startNavigation] = useTransition();
   const [refreshTransitionPending, startRefreshTransition] = useTransition();
   const [logoutPending, startLogout] = useTransition();
   const [teamPending, startTeamAction] = useTransition();
   const [projectPending, startProjectAction] = useTransition();
   const [envPending, startEnvAction] = useTransition();
+  const [deployPending, startDeployAction] = useTransition();
+  const [deletePending, startDeleteAction] = useTransition();
 
   const [state, setState] = useState<DashboardState>(() => ({
     userEmail: props.userEmail,
@@ -112,18 +213,19 @@ export function DashboardClient(props: DashboardClientProps) {
     activeProjectId: props.activeProjectId,
     project: props.project,
     envVars: props.envVars,
+    deployments: props.deployments,
+    logs: props.logs,
+    logsHasMore: props.logsHasMore,
+    deploymentsHasMore: props.deploymentsHasMore,
   }));
-
   const [dataPending, setDataPending] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
-
   const [teamFormOpen, setTeamFormOpen] = useState(false);
   const [teamName, setTeamName] = useState('');
   const [maxProjects, setMaxProjects] = useState('');
   const [maxContainers, setMaxContainers] = useState('');
   const [storageLimit, setStorageLimit] = useState('');
   const [teamFormError, setTeamFormError] = useState<string | null>(null);
-
   const [projectFormOpen, setProjectFormOpen] = useState(false);
   const [projectName, setProjectName] = useState('');
   const [projectRepo, setProjectRepo] = useState('');
@@ -131,10 +233,24 @@ export function DashboardClient(props: DashboardClientProps) {
   const [projectBuildCommand, setProjectBuildCommand] = useState('npm install');
   const [projectRunCommand, setProjectRunCommand] = useState('npm run start');
   const [projectFormError, setProjectFormError] = useState<string | null>(null);
-
   const [envKey, setEnvKey] = useState('');
   const [envValue, setEnvValue] = useState('');
   const [envError, setEnvError] = useState<string | null>(null);
+  const [deployCommit, setDeployCommit] = useState('');
+  const [deployError, setDeployError] = useState<string | null>(null);
+  const [deletingDeploymentId, setDeletingDeploymentId] = useState<string | null>(null);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logsError, setLogsError] = useState<string | null>(null);
+  const [logStreamStatus, setLogStreamStatus] = useState<LogStreamStatus>('idle');
+
+  const logStreamRef = useRef<EventSource | null>(null);
+  const streamSequenceRef = useRef(0);
+  const reconnectStateRef = useRef<ReconnectState>({
+    attempts: 0,
+    delay: STREAM_RETRY_MIN_DELAY_MS,
+    timeoutId: null,
+  });
+  const prevStreamStatusRef = useRef<LogStreamStatus>('idle');
 
   useEffect(() => {
     setState({
@@ -145,8 +261,24 @@ export function DashboardClient(props: DashboardClientProps) {
       activeProjectId: props.activeProjectId,
       project: props.project,
       envVars: props.envVars,
+      deployments: props.deployments,
+      logs: props.logs,
+      logsHasMore: props.logsHasMore,
+      deploymentsHasMore: props.deploymentsHasMore,
     });
-  }, [props.userEmail, props.teams, props.activeTeamId, props.projects, props.activeProjectId, props.project, props.envVars]);
+  }, [
+    props.userEmail,
+    props.teams,
+    props.activeTeamId,
+    props.projects,
+    props.activeProjectId,
+    props.project,
+    props.envVars,
+    props.deployments,
+    props.logs,
+    props.logsHasMore,
+    props.deploymentsHasMore,
+  ]);
 
   useEffect(() => {
     if (!toast) {
@@ -155,6 +287,163 @@ export function DashboardClient(props: DashboardClientProps) {
     const timeoutId = window.setTimeout(() => setToast(null), 4000);
     return () => window.clearTimeout(timeoutId);
   }, [toast]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+
+    const reconnectState = reconnectStateRef.current;
+    let cancelled = false;
+
+    const clearTimer = () => {
+      if (reconnectState.timeoutId !== null) {
+        window.clearTimeout(reconnectState.timeoutId);
+        reconnectState.timeoutId = null;
+      }
+    };
+
+    const closeSource = () => {
+      if (logStreamRef.current) {
+        logStreamRef.current.close();
+        logStreamRef.current = null;
+      }
+    };
+
+    if (!state.activeProjectId) {
+      clearTimer();
+      closeSource();
+      setLogStreamStatus('idle');
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const projectId = state.activeProjectId;
+    const streamUrl = `/api/dashboard/logs/stream?project=${encodeURIComponent(projectId)}`;
+
+    reconnectState.attempts = 0;
+    reconnectState.delay = STREAM_RETRY_MIN_DELAY_MS;
+    clearTimer();
+    closeSource();
+    setLogsError(null);
+    setLogStreamStatus('connecting');
+
+    const connect = () => {
+      if (cancelled) {
+        return;
+      }
+
+      clearTimer();
+      const source = new EventSource(streamUrl, { withCredentials: true });
+      logStreamRef.current = source;
+      streamSequenceRef.current = 0;
+
+      source.onopen = () => {
+        if (cancelled) {
+          return;
+        }
+        reconnectState.attempts = 0;
+        reconnectState.delay = STREAM_RETRY_MIN_DELAY_MS;
+        setLogsError(null);
+        setLogStreamStatus('connected');
+      };
+
+      source.onmessage = (event: MessageEvent<string>) => {
+        try {
+          const payload = JSON.parse(event.data) as StreamLogPayload;
+          if (!payload || payload.project_id !== projectId) {
+            return;
+          }
+
+          const metadata = normalizeStreamMetadata(payload.metadata);
+          const nextId =
+            typeof payload.id === 'number'
+              ? payload.id
+              : -Math.abs(Date.now() + ++streamSequenceRef.current);
+          const entry: ProjectLog = {
+            id: nextId,
+            project_id: payload.project_id,
+            source: payload.source,
+            level: payload.level,
+            message: payload.message,
+            metadata,
+            created_at: payload.created_at,
+          };
+
+          setState((prev) => {
+            if (prev.activeProjectId !== projectId) {
+              return prev;
+            }
+            const duplicate = prev.logs.some(
+              (log) =>
+                log.created_at === entry.created_at &&
+                log.message === entry.message &&
+                log.source === entry.source,
+            );
+            if (duplicate) {
+              return prev;
+            }
+            const nextLogs = [entry, ...prev.logs];
+            const maxEntries = LOGS_PAGE_SIZE * 4;
+            if (nextLogs.length > maxEntries) {
+              nextLogs.length = maxEntries;
+            }
+            return {
+              ...prev,
+              logs: nextLogs,
+            };
+          });
+        } catch (error) {
+          console.error('Failed to parse log stream payload', error);
+        }
+      };
+
+      source.onerror = () => {
+        if (cancelled) {
+          return;
+        }
+        source.close();
+        if (logStreamRef.current === source) {
+          logStreamRef.current = null;
+        }
+        reconnectState.attempts += 1;
+        const exceeded = reconnectState.attempts >= STREAM_RETRY_ERROR_THRESHOLD;
+        setLogStreamStatus(exceeded ? 'error' : 'reconnecting');
+        setLogsError((prev) => prev ?? 'Live log stream disrupted. Retrying…');
+        if (reconnectState.timeoutId === null) {
+          const jitter = reconnectState.delay + Math.random() * (reconnectState.delay * 0.25);
+          reconnectState.timeoutId = window.setTimeout(() => {
+            reconnectState.timeoutId = null;
+            reconnectState.delay = Math.min(reconnectState.delay * 2, STREAM_RETRY_MAX_DELAY_MS);
+            connect();
+          }, jitter);
+        }
+      };
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      clearTimer();
+      closeSource();
+    };
+  }, [state.activeProjectId]);
+
+  useEffect(() => {
+    const previous = prevStreamStatusRef.current;
+    if (previous !== logStreamStatus) {
+      if (logStreamStatus === 'connected' && (previous === 'reconnecting' || previous === 'error')) {
+        showToast('Live log stream reconnected.', 'success');
+      } else if (logStreamStatus === 'reconnecting') {
+        showToast('Live log stream interrupted. Retrying…', 'error');
+      } else if (logStreamStatus === 'error') {
+        showToast('Live log stream unavailable. Attempts will continue in the background.', 'error');
+      }
+      prevStreamStatusRef.current = logStreamStatus;
+    }
+  }, [logStreamStatus]);
 
   const selectedTeam = useMemo(() => {
     if (!state.activeTeamId) {
@@ -211,6 +500,10 @@ export function DashboardClient(props: DashboardClientProps) {
       activeProjectId: null,
       project: null,
       envVars: [],
+      deployments: [],
+      logs: [],
+      logsHasMore: false,
+      deploymentsHasMore: false,
     }));
     startNavigation(() => {
       updateSearchParams({ team: teamId, project: null });
@@ -230,6 +523,10 @@ export function DashboardClient(props: DashboardClientProps) {
       activeProjectId: projectId,
       project: prev.projects.find((project) => project.id === projectId) ?? prev.project,
       envVars: [],
+      deployments: [],
+      logs: [],
+      logsHasMore: false,
+      deploymentsHasMore: false,
     }));
     void reloadState(state.activeTeamId, projectId);
   }
@@ -358,6 +655,89 @@ export function DashboardClient(props: DashboardClientProps) {
     });
   }
 
+  function handleTriggerDeployment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!state.activeProjectId) {
+      setDeployError('Select a project first.');
+      return;
+    }
+    setDeployError(null);
+    startDeployAction(async () => {
+      const result = await triggerDeploymentAction({
+        projectId: state.activeProjectId!,
+        commit: deployCommit.trim() || undefined,
+      });
+      if (!result.success) {
+        setDeployError(result.error ?? 'Failed to trigger deployment.');
+        return;
+      }
+      setDeployCommit('');
+      await reloadState(state.activeTeamId, state.activeProjectId, 'Deployment triggered.');
+    });
+  }
+
+  function handleDeleteDeployment(deploymentId: string) {
+    if (!deploymentId) {
+      return;
+    }
+    setDeletingDeploymentId(deploymentId);
+    startDeleteAction(async () => {
+      const result = await deleteDeploymentAction({ deploymentId });
+      if (!result.success) {
+        showToast(result.error ?? 'Failed to delete deployment.', 'error');
+        setDeletingDeploymentId(null);
+        return;
+      }
+      await reloadState(state.activeTeamId, state.activeProjectId, 'Deployment deleted.');
+      setDeletingDeploymentId(null);
+    });
+  }
+
+  async function handleLoadMoreLogs() {
+    if (!state.activeProjectId || logsLoading || !state.logsHasMore) {
+      return;
+    }
+    setLogsError(null);
+    setLogsLoading(true);
+    try {
+      const params = new URLSearchParams({
+        project: state.activeProjectId,
+        offset: String(state.logs.length),
+        limit: String(LOGS_PAGE_SIZE),
+      });
+      const response = await fetch(`/api/dashboard/logs?${params.toString()}`, {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (response.status === 401) {
+        router.refresh();
+        return;
+      }
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as { error?: string } | null;
+        const message = body?.error ?? 'Unable to load more logs.';
+        setLogsError(message);
+        return;
+      }
+      const payload = (await response.json()) as { entries: ProjectLog[]; hasMore: boolean };
+      setState((prev) => {
+        const existingIds = new Set(prev.logs.map((log) => log.id));
+        const newEntries = payload.entries.filter((log) => !existingIds.has(log.id));
+        return {
+          ...prev,
+          logs: [...prev.logs, ...newEntries],
+          logsHasMore: payload.hasMore,
+        };
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to load more logs.';
+      setLogsError(message);
+    } finally {
+      setLogsLoading(false);
+    }
+  }
+
   const disableInputs =
     navigationPending ||
     refreshTransitionPending ||
@@ -365,6 +745,7 @@ export function DashboardClient(props: DashboardClientProps) {
     teamPending ||
     projectPending ||
     envPending ||
+    deployPending ||
     dataPending;
 
   return (
@@ -704,9 +1085,9 @@ export function DashboardClient(props: DashboardClientProps) {
                 </div>
                 {state.envVars.length > 0 ? (
                   <ul className="space-y-2 text-sm text-slate-200">
-                    {state.envVars.map((envVar) => (
+                    {state.envVars.map((envVar, index) => (
                       <li
-                        key={envVar.key}
+                        key={`${envVar.key}-${index}`}
                         className="flex items-center justify-between rounded-xl border border-white/10 bg-slate-900/70 px-3 py-2"
                       >
                         <span className="font-semibold">{envVar.key}</span>
@@ -755,6 +1136,157 @@ export function DashboardClient(props: DashboardClientProps) {
                     {envPending ? 'Saving…' : 'Save variable'}
                   </button>
                 </form>
+              </section>
+              <section className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-white">Deployments</h3>
+                  <span className="badge">{state.deployments.length} recent</span>
+                </div>
+                {state.deploymentsHasMore ? (
+                  <p className="text-xs text-slate-400">Showing the latest {state.deployments.length} deployments.</p>
+                ) : null}
+                <form
+                  className="space-y-2 md:flex md:items-end md:gap-3 md:space-y-0"
+                  onSubmit={handleTriggerDeployment}
+                >
+                  <label className="flex-1 text-sm text-slate-200">
+                    Commit SHA (optional)
+                    <input
+                      className="mt-1 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 focus:border-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+                      value={deployCommit}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) => setDeployCommit(event.target.value)}
+                      placeholder="main or commit SHA"
+                      disabled={disableInputs}
+                    />
+                  </label>
+                  <button
+                    type="submit"
+                    disabled={deployPending || disableInputs}
+                    className="flex w-full items-center justify-center gap-2 rounded-xl bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400 focus:outline-none focus:ring-4 focus:ring-cyan-500/40 disabled:cursor-not-allowed disabled:opacity-60 md:w-auto"
+                  >
+                    {deployPending ? 'Triggering…' : 'Trigger deployment'}
+                  </button>
+                </form>
+                {deployError ? (
+                  <p className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
+                    {deployError}
+                  </p>
+                ) : null}
+                {state.deployments.length > 0 ? (
+                  <ul className="space-y-2">
+                    {state.deployments.map((deployment) => {
+                      const commitLabel = deployment.commit_sha ? deployment.commit_sha.slice(0, 8) : 'latest';
+                      return (
+                        <li
+                          key={deployment.id}
+                          className="space-y-2 rounded-xl border border-white/10 bg-slate-900/70 p-3 text-sm text-slate-200"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-semibold text-white">{deployment.stage || 'pending'}</span>
+                            <span className={deploymentBadgeClass(deployment.status)}>{deployment.status}</span>
+                          </div>
+                          <dl className="grid gap-2 text-[11px] uppercase tracking-wide text-slate-400 sm:grid-cols-2">
+                            <div>
+                              <dt>Commit</dt>
+                              <dd className="font-mono text-xs text-slate-200">{commitLabel}</dd>
+                            </div>
+                            <div>
+                              <dt>Started</dt>
+                              <dd>{formatTimestamp(deployment.started_at)}</dd>
+                            </div>
+                            <div>
+                              <dt>Completed</dt>
+                              <dd>{formatTimestamp(deployment.completed_at)}</dd>
+                            </div>
+                            <div>
+                              <dt>Updated</dt>
+                              <dd>{formatTimestamp(deployment.updated_at)}</dd>
+                            </div>
+                          </dl>
+                          {deployment.message ? (
+                            <p className="text-xs text-slate-200">{deployment.message}</p>
+                          ) : null}
+                          {deployment.error ? (
+                            <p className="text-xs text-rose-300">Error: {deployment.error}</p>
+                          ) : null}
+                          {deployment.url ? (
+                            <a
+                              href={deployment.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center text-xs font-semibold text-cyan-300 underline-offset-2 hover:underline"
+                            >
+                              Open preview
+                            </a>
+                          ) : null}
+                          <div className="flex flex-wrap items-center gap-2 pt-1">
+                            <span className="badge">ID {formatId(deployment.id, 8)}</span>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteDeployment(deployment.id)}
+                              disabled={deletePending && deletingDeploymentId === deployment.id}
+                              className="rounded-lg border border-rose-500/50 px-2 py-1 text-[11px] font-semibold text-rose-200 transition hover:border-rose-400 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              {deletePending && deletingDeploymentId === deployment.id ? 'Deleting…' : 'Delete'}
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : (
+                  <p className="muted">No deployments recorded yet.</p>
+                )}
+              </section>
+              <section className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-white">Recent logs</h3>
+                  <span className="badge">{state.logs.length} entries</span>
+                </div>
+                {state.logs.length > 0 ? (
+                  <ul className="space-y-2">
+                    {state.logs.map((log) => (
+                      <li
+                        key={`${log.id}-${log.created_at}`}
+                        className="space-y-2 rounded-xl border border-white/10 bg-slate-900/70 p-3 text-sm text-slate-200"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+                          <span className="font-semibold uppercase text-slate-200">{log.level}</span>
+                          <span>{formatTimestamp(log.created_at)}</span>
+                        </div>
+                        <p className="text-sm text-slate-100">{log.message}</p>
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] uppercase tracking-wide text-slate-500">
+                          <span>Source: {log.source || 'n/a'}</span>
+                          <span>ID {formatId(log.project_id, 10)}</span>
+                        </div>
+                        {log.metadata ? (
+                          <pre className="whitespace-pre-wrap rounded-xl bg-slate-950/60 p-2 text-[11px] text-slate-300">
+                            {JSON.stringify(log.metadata, null, 2)}
+                          </pre>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">No logs available for this project.</p>
+                )}
+                {logsError ? (
+                  <p className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+                    {logsError}
+                  </p>
+                ) : null}
+                {state.logsHasMore ? (
+                  <button
+                    type="button"
+                    onClick={handleLoadMoreLogs}
+                    disabled={logsLoading}
+                    className="w-full rounded-xl border border-cyan-500/50 px-4 py-2 text-sm font-semibold text-cyan-200 transition hover:border-cyan-400 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {logsLoading ? 'Loading…' : `Load ${LOGS_PAGE_SIZE} more logs`}
+                  </button>
+                ) : state.logs.length > 0 ? (
+                  <p className="muted text-xs">Showing all available logs.</p>
+                ) : null}
               </section>
             </div>
           ) : null}

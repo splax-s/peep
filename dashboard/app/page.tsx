@@ -1,10 +1,29 @@
 import { LoginForm } from '@/components/LoginForm';
 import { DashboardClient } from '@/components/DashboardClient';
-import { ApiError, getProject, listEnvVars, listProjects, listTeams } from '@/lib/api';
+import { ApiError, getProject, listDeployments, listEnvVars, listLogs, listProjects, listTeams } from '@/lib/api';
+import { DEPLOYMENTS_LIMIT, LOGS_PAGE_SIZE } from '@/lib/dashboard';
 import { getSession } from '@/lib/session';
 
+type SearchParamsInput = Record<string, string | string[] | undefined> | Promise<Record<string, string | string[] | undefined>>;
+
 interface PageProps {
-  searchParams?: Record<string, string | string[] | undefined>;
+  searchParams?: SearchParamsInput;
+}
+
+function isPromise<T>(value: PromiseLike<T> | T): value is PromiseLike<T> {
+  return typeof value === 'object' && value !== null && 'then' in value && typeof (value as PromiseLike<T>).then === 'function';
+}
+
+async function resolveSearchParams(
+  params?: SearchParamsInput,
+): Promise<Record<string, string | string[] | undefined> | undefined> {
+  if (!params) {
+    return undefined;
+  }
+  if (isPromise(params)) {
+    return params;
+  }
+  return params;
 }
 
 export default async function DashboardPage({ searchParams }: PageProps) {
@@ -19,25 +38,35 @@ export default async function DashboardPage({ searchParams }: PageProps) {
   }
 
   try {
+    const params = await resolveSearchParams(searchParams);
     const teams = await listTeams(session.tokens.AccessToken);
-    const teamParam = searchParams?.team;
+    const teamParam = params?.team;
     const teamFromQuery = typeof teamParam === 'string' ? teamParam : null;
     const activeTeamId = teams.some((team) => team.id === teamFromQuery)
       ? teamFromQuery
       : teams[0]?.id ?? null;
 
     const projects = activeTeamId ? await listProjects(session.tokens.AccessToken, activeTeamId) : [];
-    const projectParam = searchParams?.project;
+    const projectParam = params?.project;
     const projectFromQuery = typeof projectParam === 'string' ? projectParam : null;
     const activeProjectId = projects.some((project) => project.id === projectFromQuery)
       ? projectFromQuery
       : projects[0]?.id ?? null;
-    const [project, envVars] = activeProjectId
+    const [project, envVars, deployments, logs] = activeProjectId
       ? await Promise.all([
           getProject(session.tokens.AccessToken, activeProjectId),
           listEnvVars(session.tokens.AccessToken, activeProjectId),
+          listDeployments(session.tokens.AccessToken, activeProjectId, DEPLOYMENTS_LIMIT),
+          listLogs(session.tokens.AccessToken, activeProjectId, LOGS_PAGE_SIZE, 0),
         ])
-      : [null, [] as Awaited<ReturnType<typeof listEnvVars>>];
+      : [
+          null,
+          [] as Awaited<ReturnType<typeof listEnvVars>>,
+          [] as Awaited<ReturnType<typeof listDeployments>>,
+          [] as Awaited<ReturnType<typeof listLogs>>,
+        ];
+    const logsHasMore = activeProjectId ? logs.length === LOGS_PAGE_SIZE : false;
+    const deploymentsHasMore = activeProjectId ? deployments.length === DEPLOYMENTS_LIMIT : false;
 
     return (
       <main className="px-4 py-10 md:px-8">
@@ -49,6 +78,10 @@ export default async function DashboardPage({ searchParams }: PageProps) {
           activeProjectId={activeProjectId}
           project={project}
           envVars={envVars}
+          deployments={deployments}
+          logs={logs}
+          logsHasMore={logsHasMore}
+          deploymentsHasMore={deploymentsHasMore}
         />
       </main>
     );

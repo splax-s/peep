@@ -71,3 +71,15 @@
 - Keep unit tests fast and deterministic with lightweight fakes for repositories and external services.
 - Run `go fmt` and `go test ./...` in both `api/` and `builder/` before committing.
 - Integration testing is performed manually today; future work includes dockerized smoke tests that exercise the end-to-end flow automatically.
+
+## Dashboard
+
+- Frontend tests run with Node's built-in test runner via `ts-node` to avoid bundler-specific tooling.
+- Execute the dashboard checks from the `dashboard/` workspace:
+
+  ```sh
+  cd dashboard
+  npm run test
+  ```
+
+- The suite currently validates API client pagination behaviour. Extend it alongside new UI functionality to keep regressions out of the SSR flow.

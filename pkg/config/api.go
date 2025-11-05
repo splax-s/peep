@@ -33,6 +33,8 @@ type APIConfig struct {
 	RuntimeDeploymentTTL     time.Duration
 	RuntimeCPULimitPercent   int
 	RuntimeMemoryLimitMB     int
+	RuntimeMetricBucketSpan  time.Duration
+	RuntimeMetricFlushEvery  time.Duration
 }
 
 // LoadAPIConfig constructs an APIConfig from environment variables.
@@ -67,5 +69,7 @@ func LoadAPIConfig() APIConfig {
 		RuntimeDeploymentTTL:     time.Duration(GetInt("RUNTIME_DEPLOYMENT_TTL_SECONDS", 86400)) * time.Second,
 		RuntimeCPULimitPercent:   GetInt("RUNTIME_CPU_LIMIT_PERCENT", 85),
 		RuntimeMemoryLimitMB:     GetInt("RUNTIME_MEMORY_LIMIT_MB", 512),
+		RuntimeMetricBucketSpan:  time.Duration(GetInt("RUNTIME_METRIC_BUCKET_SECONDS", 60)) * time.Second,
+		RuntimeMetricFlushEvery:  time.Duration(GetInt("RUNTIME_METRIC_FLUSH_SECONDS", 30)) * time.Second,
 	}
 }

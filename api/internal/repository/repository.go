@@ -58,6 +58,14 @@ type LogRepository interface {
 	ListLogsByProject(ctx context.Context, projectID string, limit, offset int) ([]domain.ProjectLog, error)
 }
 
+// RuntimeEventRepository handles runtime telemetry persistence and aggregation access.
+type RuntimeEventRepository interface {
+	InsertRuntimeEvent(ctx context.Context, event *domain.RuntimeEvent) error
+	ListRuntimeEvents(ctx context.Context, projectID string, eventType string, limit, offset int) ([]domain.RuntimeEvent, error)
+	UpsertRuntimeRollups(ctx context.Context, rollups []domain.RuntimeMetricRollup) error
+	ListRuntimeRollups(ctx context.Context, projectID string, eventType string, source string, bucketSpan time.Duration, limit int) ([]domain.RuntimeMetricRollup, error)
+}
+
 // WebhookRepository stores webhook secrets.
 type WebhookRepository interface {
 	UpsertWebhook(ctx context.Context, projectID string, secret []byte) error

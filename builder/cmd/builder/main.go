@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/splax/localvercel/builder/internal/workspace"
 	"github.com/splax/localvercel/pkg/config"
 	"github.com/splax/localvercel/pkg/logger"
+	"github.com/splax/localvercel/pkg/runtime/telemetry"
 )
 
 func main() {
@@ -44,7 +46,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	deploySvc := deploy.New(dockerClient, workspaceManager, log, cfg)
+	var runtimeEmitter deploy.TelemetryEmitter
+	if trimmed := strings.TrimSpace(cfg.RuntimeTelemetryURL); trimmed != "" {
+		client := &http.Client{Timeout: cfg.RuntimeTelemetryTimeout}
+		emitter, err := telemetry.NewEmitter(trimmed, cfg.BuilderAuthToken, client)
+		if err != nil {
+			log.Warn("runtime telemetry emitter init failed", "error", err)
+		} else {
+			runtimeEmitter = emitter
+		}
+	}
+
+	deploySvc := deploy.New(dockerClient, workspaceManager, log, cfg, runtimeEmitter)
 	router := httpx.New(log, deploySvc)
 
 	srv := &http.Server{

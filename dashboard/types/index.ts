@@ -46,6 +46,31 @@ export interface ProjectEnvVar {
   value: string;
 }
 
+export interface Deployment {
+  id: string;
+  project_id: string;
+  commit_sha: string;
+  status: string;
+  stage: string;
+  message: string;
+  url: string | null;
+  error: string | null;
+  metadata: Record<string, unknown> | null;
+  started_at: string;
+  completed_at: string | null;
+  updated_at: string;
+}
+
+export interface ProjectLog {
+  id: number;
+  project_id: string;
+  source: string;
+  level: string;
+  message: string;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+}
+
 export interface CreateTeamInput {
   name: string;
   limits: TeamLimits;

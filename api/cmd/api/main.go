@@ -57,16 +57,22 @@ func main() {
 	}
 
 	repo := postgres.New(pool)
-	hub := ws.NewHub()
+	logHub := ws.NewHub()
+	runtimeHub := ws.NewHub()
 
 	authSvc := auth.New(repo, log, cfg)
 	teamSvc := team.New(repo, log)
 	projectSvc := project.New(repo, repo, log, cfg)
-	logSvc := logs.New(repo, hub, log)
+	logSvc := logs.New(repo, logHub, log)
 	ingressSvc := ingress.New(cfg, log)
 	defer ingressSvc.Close()
 	deploySvc := deploy.New(repo, repo, repo, ingressSvc, log, cfg, logSvc)
 	webhookSvc := webhook.New(repo, log, cfg)
+
+	runtimeSvc := runtimectl.NewTelemetryService(repo, runtimeHub, log, cfg.RuntimeMetricBucketSpan, cfg.RuntimeMetricFlushEvery)
+	if runtimeSvc != nil {
+		go runtimeSvc.Run(ctx)
+	}
 
 	runtimeCtl := runtimectl.New(repo, repo, repo, ingressSvc, log, cfg)
 	if runtimeCtl != nil {
@@ -83,7 +89,7 @@ func main() {
 		}
 	}
 
-	router := httpx.NewRouter(log, authSvc, teamSvc, projectSvc, deploySvc, logSvc, webhookSvc, limiter, cfg.BuilderAuthToken, pool.Ping)
+	router := httpx.NewRouter(log, authSvc, teamSvc, projectSvc, deploySvc, logSvc, runtimeSvc, webhookSvc, limiter, cfg.BuilderAuthToken, pool.Ping)
 	defer router.Close()
 
 	srv := &http.Server{

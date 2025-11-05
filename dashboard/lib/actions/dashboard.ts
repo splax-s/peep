@@ -1,7 +1,7 @@
 'use server';
 
 import { revalidatePath } from 'next/cache';
-import { ApiError, addEnvVar, createProject, createTeam } from '@/lib/api';
+import { ApiError, addEnvVar, createProject, createTeam, deleteDeployment, triggerDeployment } from '@/lib/api';
 import { getSession } from '@/lib/session';
 
 export interface ActionResponse {
@@ -29,6 +29,15 @@ export interface AddEnvVarActionInput {
   projectId: string;
   key: string;
   value: string;
+}
+
+export interface TriggerDeploymentActionInput {
+  projectId: string;
+  commit?: string;
+}
+
+export interface DeleteDeploymentActionInput {
+  deploymentId: string;
 }
 
 function formatError(error: unknown): string {
@@ -131,6 +140,48 @@ export async function addEnvVarAction(input: AddEnvVarActionInput): Promise<Acti
 
   try {
     await addEnvVar(session.tokens.AccessToken, projectId, key, value);
+    revalidatePath('/');
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: formatError(error) };
+  }
+}
+
+export async function triggerDeploymentAction(input: TriggerDeploymentActionInput): Promise<ActionResponse> {
+  const session = await getSession();
+  if (!session) {
+    return { success: false, error: 'Not authenticated.' };
+  }
+
+  const projectId = input.projectId.trim();
+  const commit = input.commit?.trim();
+
+  if (!projectId) {
+    return { success: false, error: 'Select a project before triggering a deployment.' };
+  }
+
+  try {
+    await triggerDeployment(session.tokens.AccessToken, projectId, commit);
+    revalidatePath('/');
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: formatError(error) };
+  }
+}
+
+export async function deleteDeploymentAction(input: DeleteDeploymentActionInput): Promise<ActionResponse> {
+  const session = await getSession();
+  if (!session) {
+    return { success: false, error: 'Not authenticated.' };
+  }
+
+  const deploymentId = input.deploymentId.trim();
+  if (!deploymentId) {
+    return { success: false, error: 'Deployment identifier missing.' };
+  }
+
+  try {
+    await deleteDeployment(session.tokens.AccessToken, deploymentId);
     revalidatePath('/');
     return { success: true };
   } catch (error) {

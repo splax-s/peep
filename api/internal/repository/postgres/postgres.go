@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -27,13 +28,14 @@ func New(pool *pgxpool.Pool) *Repository {
 
 // ensure Repository satisfies interfaces.
 var (
-	_ repository.UserRepository       = (*Repository)(nil)
-	_ repository.TeamRepository       = (*Repository)(nil)
-	_ repository.ProjectRepository    = (*Repository)(nil)
-	_ repository.DeploymentRepository = (*Repository)(nil)
-	_ repository.LogRepository        = (*Repository)(nil)
-	_ repository.WebhookRepository    = (*Repository)(nil)
-	_ repository.ContainerRepository  = (*Repository)(nil)
+	_ repository.UserRepository         = (*Repository)(nil)
+	_ repository.TeamRepository         = (*Repository)(nil)
+	_ repository.ProjectRepository      = (*Repository)(nil)
+	_ repository.DeploymentRepository   = (*Repository)(nil)
+	_ repository.LogRepository          = (*Repository)(nil)
+	_ repository.WebhookRepository      = (*Repository)(nil)
+	_ repository.ContainerRepository    = (*Repository)(nil)
+	_ repository.RuntimeEventRepository = (*Repository)(nil)
 )
 
 // CreateUser inserts a user.
@@ -321,6 +323,13 @@ func emptyToNil(value string) any {
 	return value
 }
 
+func intPtrToNil(v *int) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
 func intToNil(v int) any {
 	if v == 0 {
 		return nil
@@ -340,6 +349,362 @@ func int64PtrToNil(v *int64) any {
 		return nil
 	}
 	return *v
+}
+
+// InsertRuntimeEvent persists a runtime telemetry event.
+func (r *Repository) InsertRuntimeEvent(ctx context.Context, event *domain.RuntimeEvent) error {
+	if event == nil {
+		return fmt.Errorf("runtime event required")
+	}
+	source := strings.TrimSpace(event.Source)
+	if source == "" {
+		source = "runtime"
+	}
+	event.Source = source
+	eventType := strings.TrimSpace(event.EventType)
+	if eventType == "" {
+		eventType = "http_request"
+	}
+	event.EventType = eventType
+	level := strings.TrimSpace(event.Level)
+	if level == "" {
+		level = "info"
+	}
+	event.Level = level
+	message := strings.TrimSpace(event.Message)
+	if message != event.Message {
+		event.Message = message
+	}
+	method := strings.TrimSpace(event.Method)
+	if method != event.Method {
+		event.Method = method
+	}
+	path := strings.TrimSpace(event.Path)
+	if path != event.Path {
+		event.Path = path
+	}
+	occurred := event.OccurredAt
+	if occurred.IsZero() {
+		occurred = time.Now().UTC()
+	}
+	const query = `INSERT INTO runtime_events (
+		project_id,
+		source,
+		event_type,
+		level,
+		message,
+		method,
+		path,
+		status_code,
+		latency_ms,
+		bytes_in,
+		bytes_out,
+		metadata,
+		occurred_at,
+		ingested_at
+	) VALUES (
+		$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14, NOW())
+	) RETURNING id, ingested_at`
+	var (
+		metadata any
+	)
+	if len(event.Metadata) > 0 {
+		metadata = event.Metadata
+	}
+	var (
+		id       int64
+		ingested time.Time
+	)
+	err := r.pool.QueryRow(ctx, query,
+		event.ProjectID,
+		emptyToNil(event.Source),
+		emptyToNil(event.EventType),
+		emptyToNil(event.Level),
+		nilIfEmpty(event.Message),
+		nilIfEmpty(event.Method),
+		nilIfEmpty(event.Path),
+		intPtrToNil(event.StatusCode),
+		floatPtrToNil(event.LatencyMS),
+		int64PtrToNil(event.BytesIn),
+		int64PtrToNil(event.BytesOut),
+		metadata,
+		occurred,
+		nilTime(event.IngestedAt),
+	).Scan(&id, &ingested)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23503":
+				return repository.ErrNotFound
+			case "23514", "22P02":
+				return repository.ErrInvalidArgument
+			}
+		}
+		return err
+	}
+	event.ID = id
+	event.OccurredAt = occurred
+	event.IngestedAt = ingested
+	return nil
+}
+
+func nilIfEmpty(value string) any {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return value
+}
+
+func nilTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
+
+// ListRuntimeEvents returns recent runtime telemetry events for a project.
+func (r *Repository) ListRuntimeEvents(ctx context.Context, projectID string, eventType string, limit, offset int) ([]domain.RuntimeEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	const query = `SELECT
+		id,
+		project_id,
+		source,
+		event_type,
+		level,
+		message,
+		method,
+		path,
+		status_code,
+		latency_ms,
+		bytes_in,
+		bytes_out,
+		metadata,
+		occurred_at,
+		ingested_at
+	FROM runtime_events
+	WHERE project_id = $1 AND ($2 = '' OR event_type = $2)
+	ORDER BY occurred_at DESC, id DESC
+	LIMIT $3 OFFSET $4`
+	rows, err := r.pool.Query(ctx, query, projectID, strings.TrimSpace(eventType), limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	events := make([]domain.RuntimeEvent, 0)
+	for rows.Next() {
+		var (
+			e        domain.RuntimeEvent
+			status   sql.NullInt32
+			latency  sql.NullFloat64
+			bytesIn  sql.NullInt64
+			bytesOut sql.NullInt64
+			metadata []byte
+		)
+		if err := rows.Scan(
+			&e.ID,
+			&e.ProjectID,
+			&e.Source,
+			&e.EventType,
+			&e.Level,
+			&e.Message,
+			&e.Method,
+			&e.Path,
+			&status,
+			&latency,
+			&bytesIn,
+			&bytesOut,
+			&metadata,
+			&e.OccurredAt,
+			&e.IngestedAt,
+		); err != nil {
+			return nil, err
+		}
+		if status.Valid {
+			value := int(status.Int32)
+			e.StatusCode = &value
+		}
+		if latency.Valid {
+			value := latency.Float64
+			e.LatencyMS = &value
+		}
+		if bytesIn.Valid {
+			value := bytesIn.Int64
+			e.BytesIn = &value
+		}
+		if bytesOut.Valid {
+			value := bytesOut.Int64
+			e.BytesOut = &value
+		}
+		if len(metadata) > 0 {
+			e.Metadata = append([]byte(nil), metadata...)
+		}
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
+// UpsertRuntimeRollups writes aggregated metrics for runtime events.
+func (r *Repository) UpsertRuntimeRollups(ctx context.Context, rollups []domain.RuntimeMetricRollup) error {
+	if len(rollups) == 0 {
+		return nil
+	}
+	const query = `INSERT INTO runtime_metrics_rollups (
+		project_id,
+		bucket_start,
+		bucket_span_seconds,
+		source,
+		event_type,
+		count,
+		error_count,
+		p50_ms,
+		p90_ms,
+		p95_ms,
+		p99_ms,
+		max_ms,
+		avg_ms,
+		updated_at
+	) VALUES (
+		$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW()
+	) ON CONFLICT (project_id, bucket_start, bucket_span_seconds, source, event_type)
+	DO UPDATE SET
+		count = EXCLUDED.count,
+		error_count = EXCLUDED.error_count,
+		p50_ms = EXCLUDED.p50_ms,
+		p90_ms = EXCLUDED.p90_ms,
+		p95_ms = EXCLUDED.p95_ms,
+		p99_ms = EXCLUDED.p99_ms,
+		max_ms = EXCLUDED.max_ms,
+		avg_ms = EXCLUDED.avg_ms,
+		updated_at = NOW()`
+	batch := &pgx.Batch{}
+	for _, rollup := range rollups {
+		spanSeconds := int(rollup.BucketSpan.Seconds())
+		if spanSeconds <= 0 {
+			spanSeconds = 60
+		}
+		batch.Queue(query,
+			rollup.ProjectID,
+			rollup.BucketStart,
+			spanSeconds,
+			emptyToNil(rollup.Source),
+			emptyToNil(rollup.EventType),
+			rollup.Count,
+			rollup.ErrorCount,
+			floatPtrToNil(rollup.P50MS),
+			floatPtrToNil(rollup.P90MS),
+			floatPtrToNil(rollup.P95MS),
+			floatPtrToNil(rollup.P99MS),
+			floatPtrToNil(rollup.MaxMS),
+			floatPtrToNil(rollup.AvgMS),
+		)
+	}
+	br := r.pool.SendBatch(ctx, batch)
+	defer br.Close()
+	for range rollups {
+		if _, err := br.Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ListRuntimeRollups returns aggregated metrics for a project.
+func (r *Repository) ListRuntimeRollups(ctx context.Context, projectID string, eventType string, source string, bucketSpan time.Duration, limit int) ([]domain.RuntimeMetricRollup, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	spanSeconds := int(bucketSpan.Seconds())
+	if spanSeconds <= 0 {
+		spanSeconds = 60
+	}
+	const query = `SELECT
+		project_id,
+		bucket_start,
+		bucket_span_seconds,
+		source,
+		event_type,
+		count,
+		error_count,
+		p50_ms,
+		p90_ms,
+		p95_ms,
+		p99_ms,
+		max_ms,
+		avg_ms,
+		updated_at
+	FROM runtime_metrics_rollups
+	WHERE project_id = $1
+		AND bucket_span_seconds = $2
+		AND ($3 = '' OR event_type = $3)
+		AND ($4 = '' OR source = $4)
+	ORDER BY bucket_start DESC
+	LIMIT $5`
+	rows, err := r.pool.Query(ctx, query, projectID, spanSeconds, strings.TrimSpace(eventType), strings.TrimSpace(source), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	rollups := make([]domain.RuntimeMetricRollup, 0)
+	for rows.Next() {
+		var (
+			r                            domain.RuntimeMetricRollup
+			bucketSpanSeconds            int
+			p50, p90, p95, p99, max, avg sql.NullFloat64
+		)
+		if err := rows.Scan(
+			&r.ProjectID,
+			&r.BucketStart,
+			&bucketSpanSeconds,
+			&r.Source,
+			&r.EventType,
+			&r.Count,
+			&r.ErrorCount,
+			&p50,
+			&p90,
+			&p95,
+			&p99,
+			&max,
+			&avg,
+			&r.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if bucketSpanSeconds > 0 {
+			r.BucketSpan = time.Duration(bucketSpanSeconds) * time.Second
+		}
+		if p50.Valid {
+			value := p50.Float64
+			r.P50MS = &value
+		}
+		if p90.Valid {
+			value := p90.Float64
+			r.P90MS = &value
+		}
+		if p95.Valid {
+			value := p95.Float64
+			r.P95MS = &value
+		}
+		if p99.Valid {
+			value := p99.Float64
+			r.P99MS = &value
+		}
+		if max.Valid {
+			value := max.Float64
+			r.MaxMS = &value
+		}
+		if avg.Valid {
+			value := avg.Float64
+			r.AvgMS = &value
+		}
+		rollups = append(rollups, r)
+	}
+	return rollups, rows.Err()
 }
 
 // AppendLog persists a log line.

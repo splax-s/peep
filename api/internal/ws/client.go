@@ -17,12 +17,14 @@ func NewClient(conn *websocket.Conn, logger *slog.Logger) *Client {
 	return &Client{conn: conn, log: logger}
 }
 
-// send writes a message to the websocket connection.
-func (c *Client) send(payload []byte) {
+// Send writes a message to the websocket connection.
+func (c *Client) Send(payload []byte) error {
 	if err := c.conn.WriteMessage(websocket.TextMessage, payload); err != nil {
 		c.log.Warn("websocket send failed", "error", err)
 		_ = c.conn.Close()
+		return err
 	}
+	return nil
 }
 
 // Close terminates the connection.

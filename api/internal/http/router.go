@@ -27,6 +27,7 @@ import (
 	"github.com/splax/localvercel/api/internal/service/deploy"
 	"github.com/splax/localvercel/api/internal/service/logs"
 	"github.com/splax/localvercel/api/internal/service/project"
+	runtimeSvc "github.com/splax/localvercel/api/internal/service/runtime"
 	"github.com/splax/localvercel/api/internal/service/team"
 	"github.com/splax/localvercel/api/internal/service/webhook"
 	"github.com/splax/localvercel/api/internal/ws"
@@ -41,6 +42,7 @@ type Router struct {
 	project            project.Service
 	deploy             deploy.Service
 	logs               logs.Service
+	runtime            *runtimeSvc.TelemetryService
 	webhook            webhook.Service
 	upgrader           websocket.Upgrader
 	limiter            RateLimiter
@@ -54,20 +56,28 @@ type Router struct {
 }
 
 const (
-	rateWindowDefault        = time.Minute
-	rateWindowRealtime       = 30 * time.Second
-	rateLimitSignup          = 5
-	rateLimitLogin           = 12
-	rateLimitUserWrite       = 60
-	rateLimitUserRead        = 120
-	rateLimitWebsocket       = 30
-	rateLimitBuilderCallback = 60
-	rateLimitBuilderWrite    = 600
-	healthCheckTimeout       = 2 * time.Second
+	rateWindowDefault          = time.Minute
+	rateWindowRealtime         = 30 * time.Second
+	rateLimitSignup            = 5
+	rateLimitLogin             = 12
+	rateLimitUserWrite         = 60
+	rateLimitUserRead          = 120
+	rateLimitWebsocket         = 30
+	rateLimitBuilderCallback   = 60
+	rateLimitBuilderWrite      = 600
+	rateLimitRuntimeWrite      = 1000
+	rateLimitRuntimeRead       = 240
+	runtimeStreamHeartbeat     = 20 * time.Second
+	runtimeStreamWatchdog      = 2 * runtimeStreamHeartbeat
+	runtimeStreamBackfillLimit = 100
+	healthCheckTimeout         = 2 * time.Second
+	logStreamHeartbeat         = 25 * time.Second
+	logStreamWatchdog          = 2 * logStreamHeartbeat
+	logStreamBackfillLimit     = 50
 )
 
 // NewRouter assembles routes with dependencies.
-func NewRouter(logger *slog.Logger, authSvc auth.Service, teamSvc team.Service, projectSvc project.Service, deploySvc deploy.Service, logSvc logs.Service, webhookSvc webhook.Service, limiter RateLimiter, builderToken string, dbHealth func(context.Context) error) *Router {
+func NewRouter(logger *slog.Logger, authSvc auth.Service, teamSvc team.Service, projectSvc project.Service, deploySvc deploy.Service, logSvc logs.Service, runtimeTelemetry *runtimeSvc.TelemetryService, webhookSvc webhook.Service, limiter RateLimiter, builderToken string, dbHealth func(context.Context) error) *Router {
 	r := &Router{
 		mux:     http.NewServeMux(),
 		logger:  logger,
@@ -76,6 +86,7 @@ func NewRouter(logger *slog.Logger, authSvc auth.Service, teamSvc team.Service, 
 		project: projectSvc,
 		deploy:  deploySvc,
 		logs:    logSvc,
+		runtime: runtimeTelemetry,
 		webhook: webhookSvc,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
@@ -114,10 +125,16 @@ func (r *Router) register() {
 	r.mux.HandleFunc("/projects/", r.audit("/projects/:id", r.handlerAuthRate("/projects/:id", rateLimitUserWrite, rateWindowDefault, r.handleProjectSubroutes)))
 	r.mux.HandleFunc("/deploy/", r.audit("/deploy/:id", r.handlerAuthRate("/deploy/:id", rateLimitUserRead, rateWindowDefault, r.handleDeploy)))
 	r.mux.HandleFunc("/deployments/", r.audit("/deployments/:id", r.handlerAuthRate("/deployments/:id", rateLimitUserWrite, rateWindowDefault, r.handleDeploymentDelete)))
+	r.mux.HandleFunc("/logs/stream", r.audit("/logs/stream", r.handlerAuthRate("/logs/stream", rateLimitUserRead, rateWindowRealtime, r.handleLogsStream)))
 	r.mux.HandleFunc("/logs/", r.audit("/logs/:project_id", r.handleLogs))
 	r.mux.HandleFunc("/ws/logs", r.audit("/ws/logs", r.handlerAuthRate("/ws/logs", rateLimitWebsocket, rateWindowRealtime, r.handleLogsWS)))
 	r.mux.HandleFunc("/webhook/", r.audit("/webhook", r.handleWebhook))
 	r.mux.HandleFunc("/builder/callback", r.audit("/builder/callback", r.withRateLimit("/builder/callback", rateLimitBuilderCallback, rateWindowDefault, rateLimitKeyIP, r.handleBuilderCallback)))
+	if r.runtime != nil {
+		r.mux.HandleFunc("/runtime/events", r.audit("/runtime/events", r.handleRuntimeEvents))
+		r.mux.HandleFunc("/runtime/metrics", r.audit("/runtime/metrics", r.handlerAuthRate("/runtime/metrics", rateLimitRuntimeRead, rateWindowRealtime, r.handleRuntimeMetrics)))
+		r.mux.HandleFunc("/runtime/stream", r.audit("/runtime/stream", r.handlerAuthRate("/runtime/stream", rateLimitRuntimeRead, rateWindowRealtime, r.handleRuntimeStream)))
+	}
 }
 
 func (r *Router) handleSignup(w http.ResponseWriter, req *http.Request) {
@@ -445,6 +462,329 @@ func (r *Router) handleBuilderCallback(w http.ResponseWriter, req *http.Request)
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "received"})
 }
 
+func (r *Router) handleRuntimeEvents(w http.ResponseWriter, req *http.Request) {
+	if r.runtime == nil {
+		writeError(w, http.StatusServiceUnavailable, "runtime telemetry disabled")
+		return
+	}
+	switch req.Method {
+	case http.MethodGet:
+		ctx, _, ok := r.ensureAuth(w, req)
+		if !ok {
+			return
+		}
+		if setter, ok := w.(contextSetter); ok {
+			setter.SetContext(ctx)
+		}
+		req = req.WithContext(ctx)
+		projectID := strings.TrimSpace(req.URL.Query().Get("project_id"))
+		if projectID == "" {
+			writeError(w, http.StatusBadRequest, "project_id query parameter required")
+			return
+		}
+		eventType := strings.TrimSpace(req.URL.Query().Get("event_type"))
+		limit, err := strconv.Atoi(req.URL.Query().Get("limit"))
+		if err != nil || limit <= 0 {
+			limit = 100
+		}
+		offset, err := strconv.Atoi(req.URL.Query().Get("offset"))
+		if err != nil || offset < 0 {
+			offset = 0
+		}
+		key := r.rateLimitKeyUser(req)
+		if key == "" {
+			key = rateLimitKeyIP(req)
+		}
+		decision := r.limiter.Allow(key, rateLimitRuntimeRead, rateWindowRealtime)
+		r.applyRateHeaders(w, rateLimitRuntimeRead, decision)
+		if !decision.allowed {
+			r.recordRateLimitHit("/runtime/events", rateMetricKey(key))
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+		events, err := r.runtime.ListEvents(req.Context(), projectID, eventType, limit, offset)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		payload := make([]json.RawMessage, 0, len(events))
+		for _, event := range events {
+			data, err := runtimeSvc.MarshalRuntimeEvent(event)
+			if err != nil {
+				if r.logger != nil {
+					r.logger.Warn("failed to marshal runtime event", "project_id", projectID, "error", err)
+				}
+				continue
+			}
+			payload = append(payload, json.RawMessage(data))
+		}
+		writeJSON(w, http.StatusOK, payload)
+	case http.MethodPost:
+		if !r.verifyBuilderToken(w, req) {
+			return
+		}
+		var payload struct {
+			ProjectID  string          `json:"project_id"`
+			Source     string          `json:"source"`
+			EventType  string          `json:"event_type"`
+			Level      string          `json:"level"`
+			Message    string          `json:"message"`
+			Method     string          `json:"method"`
+			Path       string          `json:"path"`
+			StatusCode *int            `json:"status_code"`
+			LatencyMS  *float64        `json:"latency_ms"`
+			BytesIn    *int64          `json:"bytes_in"`
+			BytesOut   *int64          `json:"bytes_out"`
+			Metadata   json.RawMessage `json:"metadata"`
+			OccurredAt string          `json:"occurred_at"`
+		}
+		decoder := json.NewDecoder(req.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		payload.ProjectID = strings.TrimSpace(payload.ProjectID)
+		if payload.ProjectID == "" {
+			writeError(w, http.StatusBadRequest, "project_id is required")
+			return
+		}
+		builderKey := "runtime:" + payload.ProjectID
+		decision := r.limiter.Allow(builderKey, rateLimitRuntimeWrite, rateWindowRealtime)
+		r.applyRateHeaders(w, rateLimitRuntimeWrite, decision)
+		if !decision.allowed {
+			r.recordRateLimitHit("/runtime/events", rateMetricKey(builderKey))
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+		var occurredAt time.Time
+		if strings.TrimSpace(payload.OccurredAt) != "" {
+			parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(payload.OccurredAt))
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid occurred_at format")
+				return
+			}
+			occurredAt = parsed.UTC()
+		}
+		event := domain.RuntimeEvent{
+			ProjectID:  payload.ProjectID,
+			Source:     strings.TrimSpace(payload.Source),
+			EventType:  strings.TrimSpace(payload.EventType),
+			Level:      strings.TrimSpace(payload.Level),
+			Message:    strings.TrimSpace(payload.Message),
+			Method:     strings.TrimSpace(payload.Method),
+			Path:       strings.TrimSpace(payload.Path),
+			StatusCode: payload.StatusCode,
+			LatencyMS:  payload.LatencyMS,
+			BytesIn:    payload.BytesIn,
+			BytesOut:   payload.BytesOut,
+			OccurredAt: occurredAt,
+		}
+		if len(payload.Metadata) > 0 {
+			event.Metadata = append([]byte(nil), payload.Metadata...)
+		}
+		if err := r.runtime.Ingest(req.Context(), event); err != nil {
+			switch {
+			case errors.Is(err, repository.ErrNotFound):
+				writeError(w, http.StatusNotFound, "project not found")
+			case errors.Is(err, repository.ErrInvalidArgument):
+				writeError(w, http.StatusBadRequest, err.Error())
+			default:
+				writeError(w, http.StatusInternalServerError, err.Error())
+			}
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
+	default:
+		r.methodNotAllowed(w)
+	}
+}
+
+func (r *Router) handleRuntimeMetrics(w http.ResponseWriter, req *http.Request) {
+	if r.runtime == nil {
+		writeError(w, http.StatusServiceUnavailable, "runtime telemetry disabled")
+		return
+	}
+	if req.Method != http.MethodGet {
+		r.methodNotAllowed(w)
+		return
+	}
+	projectID := strings.TrimSpace(req.URL.Query().Get("project_id"))
+	if projectID == "" {
+		writeError(w, http.StatusBadRequest, "project_id query parameter required")
+		return
+	}
+	key := r.rateLimitKeyUser(req)
+	if key == "" {
+		key = rateLimitKeyIP(req)
+	}
+	decision := r.limiter.Allow(key, rateLimitRuntimeRead, rateWindowRealtime)
+	r.applyRateHeaders(w, rateLimitRuntimeRead, decision)
+	if !decision.allowed {
+		r.recordRateLimitHit("/runtime/metrics", rateMetricKey(key))
+		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+	eventType := strings.TrimSpace(req.URL.Query().Get("event_type"))
+	source := strings.TrimSpace(req.URL.Query().Get("source"))
+	bucketSpanParam := strings.TrimSpace(req.URL.Query().Get("bucket_span"))
+	var bucketSpan time.Duration
+	if bucketSpanParam != "" {
+		if seconds, err := strconv.Atoi(bucketSpanParam); err == nil && seconds > 0 {
+			bucketSpan = time.Duration(seconds) * time.Second
+		} else if duration, err := time.ParseDuration(bucketSpanParam); err == nil {
+			bucketSpan = duration
+		} else {
+			writeError(w, http.StatusBadRequest, "invalid bucket_span value")
+			return
+		}
+	}
+	limit, err := strconv.Atoi(req.URL.Query().Get("limit"))
+	if err != nil || limit <= 0 {
+		limit = 120
+	}
+	rollups, err := r.runtime.ListRollups(req.Context(), projectID, eventType, source, bucketSpan, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, marshalRuntimeRollups(rollups))
+}
+
+func (r *Router) handleRuntimeStream(w http.ResponseWriter, req *http.Request) {
+	if r.runtime == nil {
+		writeError(w, http.StatusServiceUnavailable, "runtime telemetry disabled")
+		return
+	}
+	if req.Method != http.MethodGet {
+		r.methodNotAllowed(w)
+		return
+	}
+	if _, ok := authInfoFromContext(req.Context()); !ok {
+		r.logger.Error("auth context missing for runtime stream", "path", req.URL.Path)
+		writeError(w, http.StatusInternalServerError, "authorization context missing")
+		return
+	}
+	projectID := strings.TrimSpace(req.URL.Query().Get("project_id"))
+	if projectID == "" {
+		writeError(w, http.StatusBadRequest, "project_id query parameter required")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		r.logger.Error("http flusher not supported for runtime sse", "path", req.URL.Path)
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+	hub := r.runtime.Hub()
+	if hub == nil {
+		writeError(w, http.StatusInternalServerError, "runtime stream unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	client := ws.NewSSEClient(w, flusher, r.logger)
+	hub.Register(projectID, client)
+	defer func() {
+		hub.Unregister(projectID, client)
+		client.Close()
+	}()
+
+	done := req.Context().Done()
+	watchdogStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(runtimeStreamWatchdog)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if time.Since(client.LastActivity()) > runtimeStreamWatchdog {
+					if r.logger != nil {
+						r.logger.Info("closing idle runtime stream", "project_id", projectID)
+					}
+					client.Close()
+					return
+				}
+			case <-done:
+				return
+			case <-watchdogStop:
+				return
+			}
+		}
+	}()
+	defer close(watchdogStop)
+	if err := client.Heartbeat(); err != nil {
+		return
+	}
+	if err := r.runtimeStreamBackfill(req.Context(), projectID, client); err != nil {
+		return
+	}
+	ticker := time.NewTicker(runtimeStreamHeartbeat)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-req.Context().Done():
+			return
+		case <-ticker.C:
+			if err := client.Heartbeat(); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (r *Router) runtimeStreamBackfill(ctx context.Context, projectID string, client *ws.SSEClient) error {
+	if r.runtime == nil {
+		return nil
+	}
+	events, err := r.runtime.ListEvents(ctx, projectID, "", runtimeStreamBackfillLimit, 0)
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("failed to load runtime backfill", "project_id", projectID, "error", err)
+		}
+		return nil
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		data, err := runtimeSvc.MarshalRuntimeEvent(events[i])
+		if err != nil {
+			if r.logger != nil {
+				r.logger.Warn("failed to marshal runtime backfill", "project_id", projectID, "error", err)
+			}
+			continue
+		}
+		if err := client.Send(data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func marshalRuntimeRollups(rollups []domain.RuntimeMetricRollup) []map[string]any {
+	result := make([]map[string]any, 0, len(rollups))
+	for _, rollup := range rollups {
+		payload := map[string]any{
+			"project_id":          rollup.ProjectID,
+			"bucket_start":        rollup.BucketStart.UTC().Format(time.RFC3339Nano),
+			"bucket_span_seconds": int(rollup.BucketSpan / time.Second),
+			"source":              rollup.Source,
+			"event_type":          rollup.EventType,
+			"count":               rollup.Count,
+			"error_count":         rollup.ErrorCount,
+			"updated_at":          rollup.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		}
+		payload["p50_ms"] = rollup.P50MS
+		payload["p90_ms"] = rollup.P90MS
+		payload["p95_ms"] = rollup.P95MS
+		payload["p99_ms"] = rollup.P99MS
+		payload["max_ms"] = rollup.MaxMS
+		payload["avg_ms"] = rollup.AvgMS
+		result = append(result, payload)
+	}
+	return result
+}
+
 func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 	projectID := strings.TrimPrefix(req.URL.Path, "/logs/")
 	if projectID == "" {
@@ -558,6 +898,98 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 	default:
 		r.methodNotAllowed(w)
 	}
+}
+
+func (r *Router) handleLogsStream(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		r.methodNotAllowed(w)
+		return
+	}
+	if _, ok := authInfoFromContext(req.Context()); !ok {
+		r.logger.Error("auth context missing for logs stream", "path", req.URL.Path)
+		writeError(w, http.StatusInternalServerError, "authorization context missing")
+		return
+	}
+	projectID := strings.TrimSpace(req.URL.Query().Get("project_id"))
+	if projectID == "" {
+		writeError(w, http.StatusBadRequest, "project_id query parameter required")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		r.logger.Error("http flusher not supported for sse", "path", req.URL.Path)
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	client := ws.NewSSEClient(w, flusher, r.logger)
+	r.logs.Hub().Register(projectID, client)
+	defer func() {
+		r.logs.Hub().Unregister(projectID, client)
+		client.Close()
+	}()
+
+	done := req.Context().Done()
+	watchdogStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(logStreamWatchdog)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if time.Since(client.LastActivity()) > logStreamWatchdog {
+					r.logger.Info("closing idle log stream", "project_id", projectID)
+					client.Close()
+					return
+				}
+			case <-done:
+				return
+			case <-watchdogStop:
+				return
+			}
+		}
+	}()
+	defer close(watchdogStop)
+	if err := client.Heartbeat(); err != nil {
+		return
+	}
+	if err := r.streamBackfill(req.Context(), projectID, client); err != nil {
+		return
+	}
+	ticker := time.NewTicker(logStreamHeartbeat)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-req.Context().Done():
+			return
+		case <-ticker.C:
+			if err := client.Heartbeat(); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (r *Router) streamBackfill(ctx context.Context, projectID string, client *ws.SSEClient) error {
+	entries, err := r.logs.List(ctx, projectID, logStreamBackfillLimit, 0)
+	if err != nil {
+		r.logger.Warn("failed to load log backfill", "project_id", projectID, "error", err)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		data, err := logs.MarshalEntry(entries[i])
+		if err != nil {
+			r.logger.Warn("failed to marshal log backfill", "project_id", projectID, "error", err)
+			continue
+		}
+		if err := client.Send(data); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Router) handleLogsWS(w http.ResponseWriter, req *http.Request) {

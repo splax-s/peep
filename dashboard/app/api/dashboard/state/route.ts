@@ -1,7 +1,16 @@
 'use server';
 
 import { NextResponse } from 'next/server';
-import { ApiError, getProject, listEnvVars, listProjects, listTeams } from '@/lib/api';
+import {
+  ApiError,
+  getProject,
+  listDeployments,
+  listEnvVars,
+  listLogs,
+  listProjects,
+  listTeams,
+} from '@/lib/api';
+import { DEPLOYMENTS_LIMIT, LOGS_PAGE_SIZE } from '@/lib/dashboard';
 import { clearSession, getSession } from '@/lib/session';
 
 export async function GET(request: Request) {
@@ -23,12 +32,16 @@ export async function GET(request: Request) {
       ? projectParam
       : projects[0]?.id ?? null;
 
-    const [project, envVars] = activeProjectId
+    const [project, envVars, deployments, logs] = activeProjectId
       ? await Promise.all([
           getProject(session.tokens.AccessToken, activeProjectId),
           listEnvVars(session.tokens.AccessToken, activeProjectId),
+          listDeployments(session.tokens.AccessToken, activeProjectId, DEPLOYMENTS_LIMIT),
+          listLogs(session.tokens.AccessToken, activeProjectId, LOGS_PAGE_SIZE, 0),
         ])
-      : [null, []];
+      : [null, [], [], []];
+    const logsHasMore = logs.length === LOGS_PAGE_SIZE;
+    const deploymentsHasMore = deployments.length === DEPLOYMENTS_LIMIT;
 
     return NextResponse.json(
       {
@@ -39,6 +52,10 @@ export async function GET(request: Request) {
         activeProjectId,
         project,
         envVars,
+        deployments,
+        logs,
+        logsHasMore,
+        deploymentsHasMore,
       },
       {
         status: 200,
