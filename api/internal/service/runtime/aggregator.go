@@ -29,12 +29,12 @@ type rollupBucket struct {
 }
 
 type rollupAggregator struct {
-	mu          sync.Mutex
-	span        time.Duration
-	maxSamples  int
-	buckets     map[bucketKey]*rollupBucket
-	now         func() time.Time
-	random      *rand.Rand
+	mu         sync.Mutex
+	span       time.Duration
+	maxSamples int
+	buckets    map[bucketKey]*rollupBucket
+	now        func() time.Time
+	random     *rand.Rand
 }
 
 const defaultRollupSamples = 512

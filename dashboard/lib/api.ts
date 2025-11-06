@@ -6,6 +6,8 @@ import type {
   ProjectEnvVar,
   ProjectLog,
   SessionPayload,
+  RuntimeEvent,
+  RuntimeMetricRollup,
   Team,
 } from '@/types';
 
@@ -59,6 +61,41 @@ interface RawLogEntry {
   Message: string;
   Metadata: unknown;
   CreatedAt: string;
+}
+
+interface RawRuntimeRollup {
+  project_id: string;
+  bucket_start: string;
+  bucket_span_seconds: number;
+  source: string;
+  event_type: string;
+  count: number;
+  error_count: number;
+  p50_ms: number | null;
+  p90_ms: number | null;
+  p95_ms: number | null;
+  p99_ms: number | null;
+  max_ms: number | null;
+  avg_ms: number | null;
+  updated_at: string;
+}
+
+interface RawRuntimeEvent {
+  id: number;
+  project_id: string;
+  source: string;
+  event_type: string;
+  level: string;
+  message: string;
+  method: string;
+  path: string;
+  status_code: number | null;
+  latency_ms: number | null;
+  bytes_in: number | null;
+  bytes_out: number | null;
+  metadata: unknown;
+  occurred_at: string;
+  ingested_at: string;
 }
 
 function normalizeTeam(raw: RawTeam): Team {
@@ -141,6 +178,45 @@ function normalizeLogEntry(raw: RawLogEntry): ProjectLog {
     message: raw.Message,
     metadata: parseMetadata(raw.Metadata),
     created_at: raw.CreatedAt,
+  };
+}
+
+function normalizeRuntimeRollup(raw: RawRuntimeRollup): RuntimeMetricRollup {
+  return {
+    project_id: raw.project_id,
+    bucket_start: raw.bucket_start,
+    bucket_span_seconds: raw.bucket_span_seconds,
+    source: raw.source,
+    event_type: raw.event_type,
+    count: raw.count,
+    error_count: raw.error_count,
+    p50_ms: raw.p50_ms,
+    p90_ms: raw.p90_ms,
+    p95_ms: raw.p95_ms,
+    p99_ms: raw.p99_ms,
+    max_ms: raw.max_ms,
+    avg_ms: raw.avg_ms,
+    updated_at: raw.updated_at,
+  };
+}
+
+function normalizeRuntimeEvent(raw: RawRuntimeEvent): RuntimeEvent {
+  return {
+    id: raw.id,
+    project_id: raw.project_id,
+    source: raw.source,
+    event_type: raw.event_type,
+    level: raw.level,
+    message: raw.message,
+    method: raw.method,
+    path: raw.path,
+    status_code: raw.status_code,
+    latency_ms: raw.latency_ms,
+    bytes_in: raw.bytes_in,
+    bytes_out: raw.bytes_out,
+    metadata: parseMetadata(raw.metadata),
+    occurred_at: raw.occurred_at,
+    ingested_at: raw.ingested_at,
   };
 }
 
@@ -340,4 +416,72 @@ export async function listLogs(accessToken: string, projectId: string, limit = 5
     return [];
   }
   return logs.map(normalizeLogEntry);
+}
+
+export interface RuntimeRollupQuery {
+  eventType?: string;
+  source?: string;
+  bucketSpanSeconds?: number;
+  limit?: number;
+}
+
+export async function listRuntimeRollups(
+  accessToken: string,
+  projectId: string,
+  query: RuntimeRollupQuery = {},
+): Promise<RuntimeMetricRollup[]> {
+  const search = new URLSearchParams();
+  if (query.eventType) {
+    search.set('event_type', query.eventType);
+  }
+  if (query.source) {
+    search.set('source', query.source);
+  }
+  if (query.bucketSpanSeconds && query.bucketSpanSeconds > 0) {
+    search.set('bucket_span', String(query.bucketSpanSeconds));
+  }
+  if (query.limit && query.limit > 0) {
+    search.set('limit', String(query.limit));
+  }
+  search.set('project_id', projectId);
+  const rollups = await request<RawRuntimeRollup[] | null>(`/runtime/metrics?${search.toString()}`, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+  if (!Array.isArray(rollups)) {
+    return [];
+  }
+  return rollups.map(normalizeRuntimeRollup);
+}
+
+export interface RuntimeEventsQuery {
+  eventType?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export async function listRuntimeEvents(
+  accessToken: string,
+  projectId: string,
+  query: RuntimeEventsQuery = {},
+): Promise<RuntimeEvent[]> {
+  const search = new URLSearchParams();
+  if (query.eventType) {
+    search.set('event_type', query.eventType);
+  }
+  if (typeof query.limit === 'number' && query.limit > 0) {
+    search.set('limit', String(query.limit));
+  }
+  if (typeof query.offset === 'number' && query.offset > 0) {
+    search.set('offset', String(query.offset));
+  }
+  search.set('project_id', projectId);
+  const events = await request<RawRuntimeEvent[] | null>(`/runtime/events?${search.toString()}`, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+  if (!Array.isArray(events)) {
+    return [];
+  }
+  return events.map(normalizeRuntimeEvent);
 }

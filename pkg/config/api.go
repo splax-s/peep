@@ -51,7 +51,7 @@ func LoadAPIConfig() APIConfig {
 		BuilderURL:               GetString("BUILDER_URL", "http://builder:5000"),
 		BuilderAuthToken:         GetString("BUILDER_AUTH_TOKEN", ""),
 		NginxConfigPath:          GetString("NGINX_CONFIG_PATH", "/etc/nginx/conf.d"),
-		NginxReloadCommand:       GetString("NGINX_RELOAD_COMMAND", "nginx -s reload"),
+		NginxReloadCommand:       GetString("NGINX_RELOAD_COMMAND", ""),
 		NginxContainerName:       GetString("NGINX_CONTAINER_NAME", ""),
 		IngressDomainSuffix:      GetString("INGRESS_DOMAIN_SUFFIX", ".local.peep"),
 		LogChannelName:           GetString("PG_LOG_CHANNEL", "project_logs"),

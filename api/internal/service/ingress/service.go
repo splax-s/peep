@@ -63,8 +63,9 @@ func New(cfg config.APIConfig, logger *slog.Logger) *Service {
 	} else {
 		service.readinessTimeout = cfg.IngressReadinessTimeout
 	}
-	if service.reloadCommand == "" && strings.TrimSpace(cfg.NginxContainerName) != "" {
-		reloader, err := newDockerReloader(strings.TrimSpace(cfg.NginxContainerName))
+	containerName := strings.TrimSpace(cfg.NginxContainerName)
+	if containerName != "" {
+		reloader, err := newDockerReloader(containerName)
 		if err != nil {
 			service.logger.Warn("failed to initialise docker-based nginx reloader", "error", err)
 		} else {
@@ -219,28 +220,43 @@ func (s *Service) removeConfig(ctx context.Context, project domain.Project) erro
 }
 
 func (s *Service) reload(ctx context.Context, projectID string) error {
-	if s.reloadCommand == "" {
-		if s.docker == nil {
-			s.logger.Debug("nginx reload command not configured, skipping", "project_id", projectID)
+	if s.reloadCommand != "" {
+		cmd := exec.CommandContext(ctx, "sh", "-c", s.reloadCommand)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			if len(output) > 0 {
+				s.logger.Debug("nginx reload output", "project_id", projectID, "output", string(output))
+			}
+			s.logger.Info("nginx reloaded", "project_id", projectID)
 			return nil
 		}
-		if err := s.docker.Reload(ctx); err != nil {
-			s.logger.Error("nginx docker reload failed", "project_id", projectID, "error", err)
-			return err
-		}
-		s.logger.Info("nginx reload triggered via docker", "project_id", projectID)
-		return nil
-	}
-	cmd := exec.CommandContext(ctx, "sh", "-c", s.reloadCommand)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+
 		s.logger.Error("nginx reload failed", "project_id", projectID, "error", err, "output", string(output))
+
+		var exitErr *exec.ExitError
+		if s.docker != nil && errors.As(err, &exitErr) && exitErr.ExitCode() == 127 {
+			s.logger.Warn("reload command missing; falling back to docker reload", "project_id", projectID)
+			if derr := s.reloadWithDocker(ctx, projectID); derr == nil {
+				return nil
+			} else {
+				return fmt.Errorf("reload nginx via docker: %w", derr)
+			}
+		}
 		return fmt.Errorf("reload nginx: %w", err)
 	}
-	if len(output) > 0 {
-		s.logger.Debug("nginx reload output", "project_id", projectID, "output", string(output))
+	return s.reloadWithDocker(ctx, projectID)
+}
+
+func (s *Service) reloadWithDocker(ctx context.Context, projectID string) error {
+	if s.docker == nil {
+		s.logger.Debug("nginx reload mechanism not configured", "project_id", projectID)
+		return nil
 	}
-	s.logger.Info("nginx reloaded", "project_id", projectID)
+	if err := s.docker.Reload(ctx); err != nil {
+		s.logger.Error("nginx docker reload failed", "project_id", projectID, "error", err)
+		return err
+	}
+	s.logger.Info("nginx reload triggered via docker", "project_id", projectID)
 	return nil
 }
 

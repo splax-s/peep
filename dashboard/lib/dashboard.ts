@@ -1,2 +1,5 @@
 export const DEPLOYMENTS_LIMIT = 10;
 export const LOGS_PAGE_SIZE = 50;
+export const RUNTIME_EVENTS_PAGE_SIZE = 100;
+export const RUNTIME_METRICS_LIMIT = 120;
+export const RUNTIME_METRIC_BUCKET_SECONDS = 60;

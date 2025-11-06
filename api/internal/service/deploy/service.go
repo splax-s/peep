@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +31,8 @@ const (
 	StatusFailed  = "failed"
 	StatusSuccess = "success"
 )
+
+var projectSlugExpr = regexp.MustCompile(`[^a-z0-9-]+`)
 
 // Service orchestrates deployments via the builder service.
 type Service struct {
@@ -266,13 +270,23 @@ func (s Service) ProcessCallback(ctx context.Context, payload CallbackPayload) e
 	}
 	payload.ProjectID = projectID
 
-	metadata := mergeMetadata(payload)
 	status := mapBuilderStatus(payload.Status)
 
 	if strings.EqualFold(payload.Stage, "metrics") {
+		metadata := mergeMetadata(payload)
 		s.handleIngress(ctx, payload, metadata, status)
 		return nil
 	}
+
+	if normalized := s.normalizeDeploymentURL(ctx, payload); normalized != "" {
+		if payload.Metadata == nil {
+			payload.Metadata = make(map[string]interface{})
+		}
+		payload.Metadata["public_url"] = normalized
+		payload.URL = normalized
+	}
+
+	metadata := mergeMetadata(payload)
 	var completedAt *time.Time
 	if status == StatusFailed || status == StatusSuccess {
 		t := payload.Timestamp
@@ -357,6 +371,109 @@ func mergeMetadata(payload CallbackPayload) map[string]any {
 		meta["timestamp"] = payload.Timestamp.UTC().Format(time.RFC3339Nano)
 	}
 	return meta
+}
+
+func (s Service) normalizeDeploymentURL(ctx context.Context, payload CallbackPayload) string {
+	raw := strings.TrimSpace(payload.URL)
+	if raw == "" && payload.Metadata != nil {
+		if metaURL, ok := payload.Metadata["url"].(string); ok {
+			raw = strings.TrimSpace(metaURL)
+		}
+	}
+	hostPortPresent := false
+	if payload.Metadata != nil {
+		if port, ok := parseHostPort(payload.Metadata["host_port"]); ok && port > 0 {
+			hostPortPresent = true
+		}
+	}
+	if raw == "" && !hostPortPresent {
+		return ""
+	}
+	project, err := s.projects.GetProjectByID(ctx, payload.ProjectID)
+	if err != nil {
+		return raw
+	}
+	suffix := strings.TrimSpace(s.cfg.IngressDomainSuffix)
+	if suffix == "" {
+		suffix = ".local.peep"
+	}
+	host := canonicalProjectHost(*project, suffix)
+	if host == "" {
+		return raw
+	}
+	parsed := parseURLWithFallback(raw)
+	scheme := defaultSchemeForEnv(s.cfg.Environment)
+	if parsed != nil && strings.EqualFold(parsed.Scheme, "https") {
+		scheme = "https"
+	}
+	result := &url.URL{Scheme: scheme, Host: hostWithPort(host, 8080)}
+	if parsed != nil {
+		result.Path = parsed.Path
+		result.RawQuery = parsed.RawQuery
+		result.Fragment = parsed.Fragment
+	}
+	return result.String()
+}
+
+func canonicalProjectHost(project domain.Project, suffix string) string {
+	slug := projectSlug(project)
+	if slug == "" {
+		return ""
+	}
+	return slug + suffix
+}
+
+func projectSlug(project domain.Project) string {
+	base := strings.ToLower(strings.TrimSpace(project.Name))
+	if base == "" {
+		base = strings.ToLower(strings.TrimSpace(project.ID))
+	}
+	base = projectSlugExpr.ReplaceAllString(base, "-")
+	base = strings.Trim(base, "-")
+	if base == "" {
+		base = strings.ToLower(strings.TrimSpace(project.ID))
+	}
+	return base
+}
+
+func parseURLWithFallback(raw string) *url.URL {
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err == nil && parsed.Host != "" {
+		return parsed
+	}
+	if !strings.Contains(raw, "://") {
+		parsed, err = url.Parse("http://" + raw)
+		if err == nil {
+			parsed.Scheme = ""
+			return parsed
+		}
+	}
+	return nil
+}
+
+func defaultSchemeForEnv(env string) string {
+	if strings.EqualFold(strings.TrimSpace(env), "production") {
+		return "https"
+	}
+	return "http"
+}
+
+func hostWithPort(host string, port int) string {
+	host = strings.TrimSpace(host)
+	if host == "" || port <= 0 {
+		return host
+	}
+	// Avoid duplicating port if already present.
+	if strings.Contains(host, ":") {
+		parts := strings.Split(host, ":")
+		if len(parts) == 2 && parts[1] != "" {
+			return host
+		}
+	}
+	return fmt.Sprintf("%s:%d", host, port)
 }
 
 func mapBuilderStatus(raw string) string {

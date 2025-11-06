@@ -41,8 +41,8 @@ services:
       INGRESS_DOMAIN_SUFFIX: .local.peep
       NGINX_CONTAINER_NAME: peep-nginx
       DOCKER_HOST: unix:///var/run/docker.sock
-      RUNTIME_DEPLOYMENT_TTL_SECONDS: "900"
-      RUNTIME_CONTAINER_TTL_SECONDS: "900"
+      RUNTIME_DEPLOYMENT_TTL_SECONDS: "60"
+      RUNTIME_CONTAINER_TTL_SECONDS: "60"
     volumes:
       - ./:/workspace
       - /var/run/docker.sock:/var/run/docker.sock

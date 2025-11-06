@@ -7,10 +7,18 @@ import {
   listDeployments,
   listEnvVars,
   listLogs,
+  listRuntimeEvents,
+  listRuntimeRollups,
   listProjects,
   listTeams,
 } from '@/lib/api';
-import { DEPLOYMENTS_LIMIT, LOGS_PAGE_SIZE } from '@/lib/dashboard';
+import {
+  DEPLOYMENTS_LIMIT,
+  LOGS_PAGE_SIZE,
+  RUNTIME_EVENTS_PAGE_SIZE,
+  RUNTIME_METRIC_BUCKET_SECONDS,
+  RUNTIME_METRICS_LIMIT,
+} from '@/lib/dashboard';
 import { clearSession, getSession } from '@/lib/session';
 
 export async function GET(request: Request) {
@@ -32,16 +40,32 @@ export async function GET(request: Request) {
       ? projectParam
       : projects[0]?.id ?? null;
 
-    const [project, envVars, deployments, logs] = activeProjectId
+    const [project, envVars, deployments, logs, runtimeRollups, runtimeEvents] = activeProjectId
       ? await Promise.all([
           getProject(session.tokens.AccessToken, activeProjectId),
           listEnvVars(session.tokens.AccessToken, activeProjectId),
           listDeployments(session.tokens.AccessToken, activeProjectId, DEPLOYMENTS_LIMIT),
           listLogs(session.tokens.AccessToken, activeProjectId, LOGS_PAGE_SIZE, 0),
+          listRuntimeRollups(session.tokens.AccessToken, activeProjectId, {
+            bucketSpanSeconds: RUNTIME_METRIC_BUCKET_SECONDS,
+            limit: RUNTIME_METRICS_LIMIT,
+          }),
+          listRuntimeEvents(session.tokens.AccessToken, activeProjectId, {
+            limit: RUNTIME_EVENTS_PAGE_SIZE,
+            offset: 0,
+          }),
         ])
-      : [null, [], [], []];
+      : [
+          null,
+          [] as Awaited<ReturnType<typeof listEnvVars>>,
+          [] as Awaited<ReturnType<typeof listDeployments>>,
+          [] as Awaited<ReturnType<typeof listLogs>>,
+          [] as Awaited<ReturnType<typeof listRuntimeRollups>>,
+          [] as Awaited<ReturnType<typeof listRuntimeEvents>>,
+        ];
     const logsHasMore = logs.length === LOGS_PAGE_SIZE;
     const deploymentsHasMore = deployments.length === DEPLOYMENTS_LIMIT;
+    const runtimeEventsHasMore = runtimeEvents.length === RUNTIME_EVENTS_PAGE_SIZE;
 
     return NextResponse.json(
       {
@@ -56,6 +80,9 @@ export async function GET(request: Request) {
         logs,
         logsHasMore,
         deploymentsHasMore,
+        runtimeRollups,
+        runtimeEvents,
+        runtimeEventsHasMore,
       },
       {
         status: 200,

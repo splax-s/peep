@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -9,6 +10,7 @@ import {
   type ChangeEvent,
   type FormEvent,
 } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
 import { useRouter, useSearchParams } from 'next/navigation';
 import {
   addEnvVarAction,
@@ -18,8 +20,21 @@ import {
   triggerDeploymentAction,
 } from '@/lib/actions/dashboard';
 import { logout } from '@/lib/actions/auth';
-import { LOGS_PAGE_SIZE } from '@/lib/dashboard';
-import type { Deployment, Project, ProjectEnvVar, ProjectLog, Team } from '@/types';
+import {
+  LOGS_PAGE_SIZE,
+  RUNTIME_EVENTS_PAGE_SIZE,
+  RUNTIME_METRIC_BUCKET_SECONDS,
+  RUNTIME_METRICS_LIMIT,
+} from '@/lib/dashboard';
+import type {
+  Deployment,
+  Project,
+  ProjectEnvVar,
+  ProjectLog,
+  RuntimeEvent,
+  RuntimeMetricRollup,
+  Team,
+} from '@/types';
 
 interface DashboardClientProps {
   userEmail: string;
@@ -33,6 +48,9 @@ interface DashboardClientProps {
   logs: ProjectLog[];
   logsHasMore: boolean;
   deploymentsHasMore: boolean;
+  runtimeRollups: RuntimeMetricRollup[];
+  runtimeEvents: RuntimeEvent[];
+  runtimeEventsHasMore: boolean;
 }
 
 interface DashboardState {
@@ -47,6 +65,9 @@ interface DashboardState {
   logs: ProjectLog[];
   logsHasMore: boolean;
   deploymentsHasMore: boolean;
+  runtimeRollups: RuntimeMetricRollup[];
+  runtimeEvents: RuntimeEvent[];
+  runtimeEventsHasMore: boolean;
 }
 
 type ToastVariant = 'success' | 'error';
@@ -65,6 +86,24 @@ interface StreamLogPayload {
   metadata: unknown;
   created_at: string;
   id?: number;
+}
+
+interface RuntimeStreamPayload {
+  id: number;
+  project_id: string;
+  source: string;
+  event_type: string;
+  level: string;
+  message: string;
+  method: string;
+  path: string;
+  status_code: number | null;
+  latency_ms: number | null;
+  bytes_in: number | null;
+  bytes_out: number | null;
+  metadata: unknown;
+  occurred_at: string;
+  ingested_at: string;
 }
 
 type LogStreamStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
@@ -147,9 +186,83 @@ function formatTimestamp(value: string | null | undefined): string {
   return timestampFormatter.format(parsed);
 }
 
+function buildSparklinePath(values: number[], width: number, height: number): string {
+  if (!Array.isArray(values) || values.length === 0) {
+    return '';
+  }
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const range = max - min || 1;
+  if (values.length === 1) {
+    const singleY = height - ((values[0] - min) / range) * height;
+    return `M0 ${singleY.toFixed(2)} L${width.toFixed(2)} ${singleY.toFixed(2)}`;
+  }
+  return values
+    .map((value, index) => {
+      const x = (index / (values.length - 1)) * width;
+      const y = height - ((value - min) / range) * height;
+      const command = index === 0 ? 'M' : 'L';
+      return `${command}${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(' ');
+}
+
+function formatLatencyValue(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return '—';
+  }
+  if (value >= 100) {
+    return `${Math.round(value)} ms`;
+  }
+  if (value >= 10) {
+    return `${value.toFixed(1)} ms`;
+  }
+  return `${value.toFixed(2)} ms`;
+}
+
+function formatRatePerSecond(count: number, bucketSpanSeconds: number): string {
+  if (!Number.isFinite(count) || count < 0 || bucketSpanSeconds <= 0) {
+    return '—';
+  }
+  const perSecond = count / bucketSpanSeconds;
+  if (perSecond >= 1) {
+    return `${perSecond.toFixed(1)}/s`;
+  }
+  const perMinute = perSecond * 60;
+  return `${perMinute.toFixed(1)}/min`;
+}
+
+function formatPercent(value: number): string {
+  if (!Number.isFinite(value)) {
+    return '—';
+  }
+  if (value >= 1) {
+    return `${value.toFixed(1)}%`;
+  }
+  return `${value.toFixed(2)}%`;
+}
+
+function streamStatusBadgeClass(status: LogStreamStatus): string {
+  const base = 'badge text-[11px] uppercase tracking-wide';
+  switch (status) {
+    case 'connected':
+      return `${base} border-emerald-500/60 bg-emerald-500/15 text-emerald-200`;
+    case 'connecting':
+      return `${base} border-cyan-500/60 bg-cyan-500/15 text-cyan-200`;
+    case 'reconnecting':
+      return `${base} border-amber-500/60 bg-amber-500/15 text-amber-200`;
+    case 'error':
+      return `${base} border-rose-500/60 bg-rose-500/15 text-rose-200`;
+    default:
+      return `${base} border-slate-500/40 bg-slate-500/10 text-slate-200`;
+  }
+}
+
 const STREAM_RETRY_MIN_DELAY_MS = 2000;
 const STREAM_RETRY_MAX_DELAY_MS = 30000;
 const STREAM_RETRY_ERROR_THRESHOLD = 5;
+const DEFAULT_BUILD_COMMAND = 'docker build -f Dockerfile .';
+const DEFAULT_RUN_COMMAND = 'docker compose up --build';
 
 function normalizeStreamMetadata(metadata: unknown): Record<string, unknown> | null {
   if (!metadata) {
@@ -204,6 +317,8 @@ export function DashboardClient(props: DashboardClientProps) {
   const [envPending, startEnvAction] = useTransition();
   const [deployPending, startDeployAction] = useTransition();
   const [deletePending, startDeleteAction] = useTransition();
+  const runtimeBucketOptions = [60, 300, 900];
+  const runtimeLevelOptions = ['debug', 'info', 'warn', 'error'] as const;
 
   const [state, setState] = useState<DashboardState>(() => ({
     userEmail: props.userEmail,
@@ -217,6 +332,9 @@ export function DashboardClient(props: DashboardClientProps) {
     logs: props.logs,
     logsHasMore: props.logsHasMore,
     deploymentsHasMore: props.deploymentsHasMore,
+    runtimeRollups: props.runtimeRollups,
+    runtimeEvents: props.runtimeEvents,
+    runtimeEventsHasMore: props.runtimeEventsHasMore,
   }));
   const [dataPending, setDataPending] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
@@ -230,8 +348,8 @@ export function DashboardClient(props: DashboardClientProps) {
   const [projectName, setProjectName] = useState('');
   const [projectRepo, setProjectRepo] = useState('');
   const [projectType, setProjectType] = useState<'frontend' | 'backend'>('frontend');
-  const [projectBuildCommand, setProjectBuildCommand] = useState('npm install');
-  const [projectRunCommand, setProjectRunCommand] = useState('npm run start');
+  const [projectBuildCommand, setProjectBuildCommand] = useState(DEFAULT_BUILD_COMMAND);
+  const [projectRunCommand, setProjectRunCommand] = useState(DEFAULT_RUN_COMMAND);
   const [projectFormError, setProjectFormError] = useState<string | null>(null);
   const [envKey, setEnvKey] = useState('');
   const [envValue, setEnvValue] = useState('');
@@ -242,6 +360,18 @@ export function DashboardClient(props: DashboardClientProps) {
   const [logsLoading, setLogsLoading] = useState(false);
   const [logsError, setLogsError] = useState<string | null>(null);
   const [logStreamStatus, setLogStreamStatus] = useState<LogStreamStatus>('idle');
+  const [insightTab, setInsightTab] = useState<'runtime' | 'build'>('runtime');
+  const [runtimeSearchTerm, setRuntimeSearchTerm] = useState('');
+  const [runtimeLevelFilter, setRuntimeLevelFilter] = useState<'all' | 'debug' | 'info' | 'warn' | 'error'>('all');
+  const [runtimeMethodFilter, setRuntimeMethodFilter] = useState<'all' | string>('all');
+  const [runtimeSourceFilter, setRuntimeSourceFilter] = useState<'all' | string>('all');
+  const [runtimeEventTypeFilter, setRuntimeEventTypeFilter] = useState<'all' | string>('all');
+  const [runtimeEventsLoading, setRuntimeEventsLoading] = useState(false);
+  const [runtimeEventsError, setRuntimeEventsError] = useState<string | null>(null);
+  const [runtimeStreamStatus, setRuntimeStreamStatus] = useState<LogStreamStatus>('idle');
+  const [runtimeMetricsLoading, setRuntimeMetricsLoading] = useState(false);
+  const [runtimeMetricsError, setRuntimeMetricsError] = useState<string | null>(null);
+  const [runtimeBucketSpan, setRuntimeBucketSpan] = useState(RUNTIME_METRIC_BUCKET_SECONDS);
 
   const logStreamRef = useRef<EventSource | null>(null);
   const streamSequenceRef = useRef(0);
@@ -251,6 +381,97 @@ export function DashboardClient(props: DashboardClientProps) {
     timeoutId: null,
   });
   const prevStreamStatusRef = useRef<LogStreamStatus>('idle');
+  const runtimeStreamRef = useRef<EventSource | null>(null);
+  const runtimeStreamSequenceRef = useRef(0);
+  const runtimeReconnectStateRef = useRef<ReconnectState>({
+    attempts: 0,
+    delay: STREAM_RETRY_MIN_DELAY_MS,
+    timeoutId: null,
+  });
+  const prevRuntimeStreamStatusRef = useRef<LogStreamStatus>('idle');
+  const runtimeMetricsRefreshTimerRef = useRef<number | null>(null);
+  const runtimeBucketSpanRef = useRef(runtimeBucketSpan);
+  const runtimeEventTypeFilterRef = useRef(runtimeEventTypeFilter);
+
+  const loadRuntimeMetrics = useCallback(
+    async (projectId: string, bucketSpanSeconds: number, eventType: string | 'all') => {
+      if (!projectId) {
+        return;
+      }
+
+      setRuntimeMetricsError(null);
+      setRuntimeMetricsLoading(true);
+
+      try {
+        const params = new URLSearchParams({
+          project: projectId,
+          bucketSpan: String(bucketSpanSeconds),
+          limit: String(RUNTIME_METRICS_LIMIT),
+        });
+        if (eventType && eventType !== 'all') {
+          params.set('eventType', eventType);
+        }
+
+        const response = await fetch(`/api/dashboard/runtime/metrics?${params.toString()}`, {
+          method: 'GET',
+          credentials: 'include',
+          cache: 'no-store',
+        });
+
+        if (response.status === 401) {
+          router.refresh();
+          return;
+        }
+
+        if (!response.ok) {
+          const body = (await response.json().catch(() => null)) as { error?: string } | null;
+          const message = body?.error ?? 'Unable to refresh runtime metrics.';
+          setRuntimeMetricsError(message);
+          return;
+        }
+
+        const payload = (await response.json()) as { rollups: RuntimeMetricRollup[] | undefined };
+        const rollups = Array.isArray(payload.rollups) ? payload.rollups : [];
+        setState((prev) => {
+          if (prev.activeProjectId !== projectId) {
+            return prev;
+          }
+          return {
+            ...prev,
+            runtimeRollups: rollups.slice(0, RUNTIME_METRICS_LIMIT),
+          };
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unable to refresh runtime metrics.';
+        setRuntimeMetricsError(message);
+      } finally {
+        setRuntimeMetricsLoading(false);
+      }
+    },
+    [router],
+  );
+
+  const queueRuntimeMetricsRefresh = useCallback((projectId: string) => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    if (!projectId) {
+      return;
+    }
+    if (runtimeMetricsRefreshTimerRef.current !== null) {
+      return;
+    }
+
+    runtimeMetricsRefreshTimerRef.current = window.setTimeout(() => {
+      runtimeMetricsRefreshTimerRef.current = null;
+      if (!projectId) {
+        return;
+      }
+      const bucketSpan = runtimeBucketSpanRef.current;
+      const eventType = runtimeEventTypeFilterRef.current;
+      void loadRuntimeMetrics(projectId, bucketSpan, eventType);
+    }, 1500);
+  }, [loadRuntimeMetrics]);
 
   useEffect(() => {
     setState({
@@ -265,6 +486,9 @@ export function DashboardClient(props: DashboardClientProps) {
       logs: props.logs,
       logsHasMore: props.logsHasMore,
       deploymentsHasMore: props.deploymentsHasMore,
+      runtimeRollups: props.runtimeRollups,
+      runtimeEvents: props.runtimeEvents,
+      runtimeEventsHasMore: props.runtimeEventsHasMore,
     });
   }, [
     props.userEmail,
@@ -278,7 +502,18 @@ export function DashboardClient(props: DashboardClientProps) {
     props.logs,
     props.logsHasMore,
     props.deploymentsHasMore,
+    props.runtimeRollups,
+    props.runtimeEvents,
+    props.runtimeEventsHasMore,
   ]);
+
+  useEffect(() => {
+    runtimeBucketSpanRef.current = runtimeBucketSpan;
+  }, [runtimeBucketSpan]);
+
+  useEffect(() => {
+    runtimeEventTypeFilterRef.current = runtimeEventTypeFilter;
+  }, [runtimeEventTypeFilter]);
 
   useEffect(() => {
     if (!toast) {
@@ -432,6 +667,154 @@ export function DashboardClient(props: DashboardClientProps) {
   }, [state.activeProjectId]);
 
   useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+
+    const reconnectState = runtimeReconnectStateRef.current;
+    let cancelled = false;
+
+    const clearTimer = () => {
+      if (reconnectState.timeoutId !== null) {
+        window.clearTimeout(reconnectState.timeoutId);
+        reconnectState.timeoutId = null;
+      }
+    };
+
+    const closeSource = () => {
+      if (runtimeStreamRef.current) {
+        runtimeStreamRef.current.close();
+        runtimeStreamRef.current = null;
+      }
+    };
+
+    if (!state.activeProjectId) {
+      clearTimer();
+      closeSource();
+      setRuntimeStreamStatus('idle');
+      setRuntimeEventsError(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const projectId = state.activeProjectId;
+    const streamUrl = `/api/dashboard/runtime/stream?project=${encodeURIComponent(projectId)}`;
+
+    reconnectState.attempts = 0;
+    reconnectState.delay = STREAM_RETRY_MIN_DELAY_MS;
+    clearTimer();
+    closeSource();
+    setRuntimeEventsError(null);
+    setRuntimeStreamStatus('connecting');
+
+    const connect = () => {
+      if (cancelled) {
+        return;
+      }
+
+      clearTimer();
+      const source = new EventSource(streamUrl, { withCredentials: true });
+      runtimeStreamRef.current = source;
+      runtimeStreamSequenceRef.current = 0;
+
+      source.onopen = () => {
+        if (cancelled) {
+          return;
+        }
+        reconnectState.attempts = 0;
+        reconnectState.delay = STREAM_RETRY_MIN_DELAY_MS;
+        setRuntimeEventsError(null);
+        setRuntimeStreamStatus('connected');
+      };
+
+      source.onmessage = (event: MessageEvent<string>) => {
+        try {
+          const payload = JSON.parse(event.data) as RuntimeStreamPayload;
+          if (!payload || payload.project_id !== projectId) {
+            return;
+          }
+          const metadata = normalizeStreamMetadata(payload.metadata);
+          const nextId =
+            typeof payload.id === 'number'
+              ? payload.id
+              : -Math.abs(Date.now() + ++runtimeStreamSequenceRef.current);
+          const entry: RuntimeEvent = {
+            id: nextId,
+            project_id: payload.project_id,
+            source: payload.source,
+            event_type: payload.event_type,
+            level: payload.level || 'info',
+            message: payload.message,
+            method: payload.method,
+            path: payload.path,
+            status_code: payload.status_code,
+            latency_ms: payload.latency_ms,
+            bytes_in: payload.bytes_in,
+            bytes_out: payload.bytes_out,
+            metadata,
+            occurred_at: payload.occurred_at,
+            ingested_at: payload.ingested_at,
+          };
+
+          setState((prev) => {
+            if (prev.activeProjectId !== projectId) {
+              return prev;
+            }
+            const duplicate = prev.runtimeEvents.some((event) => event.id === entry.id);
+            if (duplicate) {
+              return prev;
+            }
+            const nextEvents = [entry, ...prev.runtimeEvents];
+            const maxEntries = RUNTIME_EVENTS_PAGE_SIZE * 4;
+            if (nextEvents.length > maxEntries) {
+              nextEvents.length = maxEntries;
+            }
+            return {
+              ...prev,
+              runtimeEvents: nextEvents,
+            };
+          });
+
+          queueRuntimeMetricsRefresh(projectId);
+        } catch (error) {
+          console.error('Failed to parse runtime event stream payload', error);
+        }
+      };
+
+      source.onerror = () => {
+        if (cancelled) {
+          return;
+        }
+        source.close();
+        if (runtimeStreamRef.current === source) {
+          runtimeStreamRef.current = null;
+        }
+        reconnectState.attempts += 1;
+        const exceeded = reconnectState.attempts >= STREAM_RETRY_ERROR_THRESHOLD;
+        setRuntimeStreamStatus(exceeded ? 'error' : 'reconnecting');
+        setRuntimeEventsError((prev) => prev ?? 'Live runtime stream disrupted. Retrying…');
+        if (reconnectState.timeoutId === null) {
+          const jitter = reconnectState.delay + Math.random() * (reconnectState.delay * 0.25);
+          reconnectState.timeoutId = window.setTimeout(() => {
+            reconnectState.timeoutId = null;
+            reconnectState.delay = Math.min(reconnectState.delay * 2, STREAM_RETRY_MAX_DELAY_MS);
+            connect();
+          }, jitter);
+        }
+      };
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      clearTimer();
+      closeSource();
+    };
+  }, [state.activeProjectId, queueRuntimeMetricsRefresh]);
+
+  useEffect(() => {
     const previous = prevStreamStatusRef.current;
     if (previous !== logStreamStatus) {
       if (logStreamStatus === 'connected' && (previous === 'reconnecting' || previous === 'error')) {
@@ -445,6 +828,29 @@ export function DashboardClient(props: DashboardClientProps) {
     }
   }, [logStreamStatus]);
 
+  useEffect(() => {
+    const previous = prevRuntimeStreamStatusRef.current;
+    if (previous !== runtimeStreamStatus) {
+      if (runtimeStreamStatus === 'connected' && (previous === 'reconnecting' || previous === 'error')) {
+        showToast('Runtime event stream reconnected.', 'success');
+      } else if (runtimeStreamStatus === 'reconnecting') {
+        showToast('Runtime event stream interrupted. Retrying…', 'error');
+      } else if (runtimeStreamStatus === 'error') {
+        showToast('Runtime event stream unavailable. Attempts will continue in the background.', 'error');
+      }
+      prevRuntimeStreamStatusRef.current = runtimeStreamStatus;
+    }
+  }, [runtimeStreamStatus]);
+
+  useEffect(() => {
+    return () => {
+      if (typeof window !== 'undefined' && runtimeMetricsRefreshTimerRef.current !== null) {
+        window.clearTimeout(runtimeMetricsRefreshTimerRef.current);
+        runtimeMetricsRefreshTimerRef.current = null;
+      }
+    };
+  }, []);
+
   const selectedTeam = useMemo(() => {
     if (!state.activeTeamId) {
       return null;
@@ -452,15 +858,161 @@ export function DashboardClient(props: DashboardClientProps) {
     return state.teams.find((team) => team.id === state.activeTeamId) ?? null;
   }, [state.activeTeamId, state.teams]);
 
+  const runtimeEventTypes = useMemo(() => {
+    const values = new Set<string>();
+    state.runtimeEvents.forEach((event) => {
+      if (event.event_type) {
+        values.add(event.event_type);
+      }
+    });
+    return Array.from(values).sort((a, b) => a.localeCompare(b));
+  }, [state.runtimeEvents]);
+
+  const runtimeMethodOptions = useMemo(() => {
+    const values = new Set<string>();
+    state.runtimeEvents.forEach((event) => {
+      const method = (event.method || '').toUpperCase();
+      if (method) {
+        values.add(method);
+      }
+    });
+    return Array.from(values).sort((a, b) => a.localeCompare(b));
+  }, [state.runtimeEvents]);
+
+  const runtimeSourceOptions = useMemo(() => {
+    const values = new Set<string>();
+    state.runtimeEvents.forEach((event) => {
+      if (event.source) {
+        values.add(event.source);
+      }
+    });
+    return Array.from(values).sort((a, b) => a.localeCompare(b));
+  }, [state.runtimeEvents]);
+
+  const runtimeRollupsSorted = useMemo(() => {
+    return [...state.runtimeRollups].sort((a, b) => {
+      const aTime = new Date(a.bucket_start).getTime();
+      const bTime = new Date(b.bucket_start).getTime();
+      return aTime - bTime;
+    });
+  }, [state.runtimeRollups]);
+
+  const runtimeLatencySeries = useMemo(() => {
+    if (runtimeRollupsSorted.length === 0) {
+      return [] as number[];
+    }
+    return runtimeRollupsSorted.map((rollup) => {
+      const candidates = [rollup.p95_ms, rollup.p90_ms, rollup.p50_ms];
+      const value = candidates.find((candidate) => typeof candidate === 'number' && Number.isFinite(candidate));
+      return typeof value === 'number' ? value : 0;
+    });
+  }, [runtimeRollupsSorted]);
+
+  const runtimeThroughputSeries = useMemo(() => runtimeRollupsSorted.map((rollup) => rollup.count), [runtimeRollupsSorted]);
+
+  const latencySparklinePath = useMemo(
+    () => buildSparklinePath(runtimeLatencySeries, 160, 48),
+    [runtimeLatencySeries],
+  );
+
+  const throughputSparklinePath = useMemo(
+    () => buildSparklinePath(runtimeThroughputSeries, 160, 48),
+    [runtimeThroughputSeries],
+  );
+
+  const runtimeSummary = useMemo(() => {
+    if (runtimeRollupsSorted.length === 0) {
+      return null;
+    }
+    let totalCount = 0;
+    let totalErrors = 0;
+    runtimeRollupsSorted.forEach((rollup) => {
+      totalCount += rollup.count;
+      totalErrors += rollup.error_count;
+    });
+    const latest = runtimeRollupsSorted[runtimeRollupsSorted.length - 1];
+    const errorRate = totalCount > 0 ? (totalErrors / totalCount) * 100 : 0;
+    return {
+      totalCount,
+      totalErrors,
+      errorRate,
+      latest,
+    };
+  }, [runtimeRollupsSorted]);
+
+  const filteredRuntimeEvents = useMemo(() => {
+    const search = runtimeSearchTerm.trim().toLowerCase();
+    return state.runtimeEvents.filter((event) => {
+      if (runtimeEventTypeFilter !== 'all' && event.event_type !== runtimeEventTypeFilter) {
+        return false;
+      }
+      if (runtimeLevelFilter !== 'all' && (event.level || '').toLowerCase() !== runtimeLevelFilter) {
+        return false;
+      }
+      if (runtimeMethodFilter !== 'all' && (event.method || '').toUpperCase() !== runtimeMethodFilter) {
+        return false;
+      }
+      if (runtimeSourceFilter !== 'all' && event.source !== runtimeSourceFilter) {
+        return false;
+      }
+      if (search) {
+        const metadataText = event.metadata ? JSON.stringify(event.metadata).toLowerCase() : '';
+        const haystack = `${event.message ?? ''} ${event.path ?? ''} ${metadataText}`.toLowerCase();
+        if (!haystack.includes(search)) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }, [
+    state.runtimeEvents,
+    runtimeEventTypeFilter,
+    runtimeLevelFilter,
+    runtimeMethodFilter,
+    runtimeSourceFilter,
+    runtimeSearchTerm,
+  ]);
+
   function showToast(message: string, variant: ToastVariant) {
     setToast({ id: Date.now(), message, variant });
   }
+
+  const handleRuntimeBucketSpanSelect = useCallback(
+    (value: number) => {
+      setRuntimeBucketSpan(value);
+      if (!state.activeProjectId) {
+        return;
+      }
+      void loadRuntimeMetrics(state.activeProjectId, value, runtimeEventTypeFilter);
+    },
+    [state.activeProjectId, runtimeEventTypeFilter, loadRuntimeMetrics],
+  );
+
+  const handleRuntimeEventTypeFilterSelect = useCallback(
+    (value: string | 'all') => {
+      setRuntimeEventTypeFilter(value);
+      if (!state.activeProjectId) {
+        return;
+      }
+      void loadRuntimeMetrics(state.activeProjectId, runtimeBucketSpan, value);
+    },
+    [state.activeProjectId, runtimeBucketSpan, loadRuntimeMetrics],
+  );
+
+  const handleManualRuntimeMetricsRefresh = useCallback(() => {
+    if (!state.activeProjectId) {
+      return;
+    }
+    void loadRuntimeMetrics(state.activeProjectId, runtimeBucketSpan, runtimeEventTypeFilter);
+  }, [state.activeProjectId, runtimeBucketSpan, runtimeEventTypeFilter, loadRuntimeMetrics]);
 
   async function reloadState(nextTeamId: string | null, nextProjectId: string | null, successMessage?: string) {
     setDataPending(true);
     try {
       const nextState = await fetchDashboardState(nextTeamId, nextProjectId);
       setState(nextState);
+      setRuntimeMetricsError(null);
+      setRuntimeEventsError(null);
       if (successMessage) {
         showToast(successMessage, 'success');
       }
@@ -504,7 +1056,22 @@ export function DashboardClient(props: DashboardClientProps) {
       logs: [],
       logsHasMore: false,
       deploymentsHasMore: false,
+      runtimeRollups: [],
+      runtimeEvents: [],
+      runtimeEventsHasMore: false,
     }));
+    setRuntimeEventsError(null);
+    setRuntimeMetricsError(null);
+    setRuntimeSearchTerm('');
+    setRuntimeLevelFilter('all');
+    setRuntimeMethodFilter('all');
+    setRuntimeSourceFilter('all');
+    setRuntimeEventTypeFilter('all');
+    setInsightTab('runtime');
+    if (typeof window !== 'undefined' && runtimeMetricsRefreshTimerRef.current !== null) {
+      window.clearTimeout(runtimeMetricsRefreshTimerRef.current);
+      runtimeMetricsRefreshTimerRef.current = null;
+    }
     startNavigation(() => {
       updateSearchParams({ team: teamId, project: null });
     });
@@ -527,7 +1094,22 @@ export function DashboardClient(props: DashboardClientProps) {
       logs: [],
       logsHasMore: false,
       deploymentsHasMore: false,
+      runtimeRollups: [],
+      runtimeEvents: [],
+      runtimeEventsHasMore: false,
     }));
+    setRuntimeEventsError(null);
+    setRuntimeMetricsError(null);
+    setRuntimeSearchTerm('');
+    setRuntimeLevelFilter('all');
+    setRuntimeMethodFilter('all');
+    setRuntimeSourceFilter('all');
+    setRuntimeEventTypeFilter('all');
+    setInsightTab('runtime');
+    if (typeof window !== 'undefined' && runtimeMetricsRefreshTimerRef.current !== null) {
+      window.clearTimeout(runtimeMetricsRefreshTimerRef.current);
+      runtimeMetricsRefreshTimerRef.current = null;
+    }
     void reloadState(state.activeTeamId, projectId);
   }
 
@@ -615,8 +1197,8 @@ export function DashboardClient(props: DashboardClientProps) {
       }
       setProjectName('');
       setProjectRepo('');
-      setProjectBuildCommand('npm install');
-      setProjectRunCommand('npm run start');
+  setProjectBuildCommand(DEFAULT_BUILD_COMMAND);
+  setProjectRunCommand(DEFAULT_RUN_COMMAND);
       setProjectFormOpen(false);
       await reloadState(state.activeTeamId, null, 'Project provisioned.');
     });
@@ -735,6 +1317,58 @@ export function DashboardClient(props: DashboardClientProps) {
       setLogsError(message);
     } finally {
       setLogsLoading(false);
+    }
+  }
+
+  async function handleLoadMoreRuntimeEvents() {
+    const activeProjectId = state.activeProjectId;
+    if (!activeProjectId || runtimeEventsLoading || !state.runtimeEventsHasMore) {
+      return;
+    }
+    setRuntimeEventsError(null);
+    setRuntimeEventsLoading(true);
+    try {
+      const params = new URLSearchParams({
+        project: activeProjectId,
+        offset: String(state.runtimeEvents.length),
+        limit: String(RUNTIME_EVENTS_PAGE_SIZE),
+      });
+      if (runtimeEventTypeFilter !== 'all') {
+        params.set('eventType', runtimeEventTypeFilter);
+      }
+      const response = await fetch(`/api/dashboard/runtime/events?${params.toString()}`, {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (response.status === 401) {
+        router.refresh();
+        return;
+      }
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as { error?: string } | null;
+        const message = body?.error ?? 'Unable to load more runtime events.';
+        setRuntimeEventsError(message);
+        return;
+      }
+      const payload = (await response.json()) as { entries: RuntimeEvent[]; hasMore: boolean };
+      setState((prev) => {
+        if (prev.activeProjectId !== activeProjectId) {
+          return prev;
+        }
+        const existingIds = new Set(prev.runtimeEvents.map((event) => event.id));
+        const additions = payload.entries.filter((event) => !existingIds.has(event.id));
+        return {
+          ...prev,
+          runtimeEvents: [...prev.runtimeEvents, ...additions],
+          runtimeEventsHasMore: payload.hasMore,
+        };
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to load more runtime events.';
+      setRuntimeEventsError(message);
+    } finally {
+      setRuntimeEventsLoading(false);
     }
   }
 
@@ -1002,7 +1636,7 @@ export function DashboardClient(props: DashboardClientProps) {
                         className="mt-1 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
                         value={projectBuildCommand}
                         onChange={(event: ChangeEvent<HTMLInputElement>) => setProjectBuildCommand(event.target.value)}
-                        placeholder="npm install"
+                        placeholder={DEFAULT_BUILD_COMMAND}
                         required
                         disabled={disableInputs}
                       />
@@ -1014,7 +1648,7 @@ export function DashboardClient(props: DashboardClientProps) {
                       className="mt-1 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
                       value={projectRunCommand}
                       onChange={(event: ChangeEvent<HTMLInputElement>) => setProjectRunCommand(event.target.value)}
-                      placeholder="npm run start"
+                      placeholder={DEFAULT_RUN_COMMAND}
                       required
                       disabled={disableInputs}
                     />
@@ -1238,55 +1872,355 @@ export function DashboardClient(props: DashboardClientProps) {
                   <p className="muted">No deployments recorded yet.</p>
                 )}
               </section>
-              <section className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-white">Recent logs</h3>
-                  <span className="badge">{state.logs.length} entries</span>
-                </div>
-                {state.logs.length > 0 ? (
-                  <ul className="space-y-2">
-                    {state.logs.map((log) => (
-                      <li
-                        key={`${log.id}-${log.created_at}`}
-                        className="space-y-2 rounded-xl border border-white/10 bg-slate-900/70 p-3 text-sm text-slate-200"
+              <section className="space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-white">Runtime insights</h3>
+                    <p className="text-xs text-slate-400">
+                      {runtimeSummary
+                        ? `Tracking ${runtimeSummary.totalCount} events across ${runtimeBucketSpan}-second buckets.`
+                        : 'No runtime metrics collected yet.'}
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300">
+                    <label className="flex items-center gap-1">
+                      Bucket
+                      <select
+                        className="rounded-lg border border-white/10 bg-slate-900/80 px-2 py-1 text-xs text-slate-200 focus:border-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+                        value={runtimeBucketSpan}
+                        onChange={(event: ChangeEvent<HTMLSelectElement>) =>
+                          handleRuntimeBucketSpanSelect(Number(event.target.value))
+                        }
                       >
-                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
-                          <span className="font-semibold uppercase text-slate-200">{log.level}</span>
-                          <span>{formatTimestamp(log.created_at)}</span>
-                        </div>
-                        <p className="text-sm text-slate-100">{log.message}</p>
-                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] uppercase tracking-wide text-slate-500">
-                          <span>Source: {log.source || 'n/a'}</span>
-                          <span>ID {formatId(log.project_id, 10)}</span>
-                        </div>
-                        {log.metadata ? (
-                          <pre className="whitespace-pre-wrap rounded-xl bg-slate-950/60 p-2 text-[11px] text-slate-300">
-                            {JSON.stringify(log.metadata, null, 2)}
-                          </pre>
-                        ) : null}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="muted">No logs available for this project.</p>
-                )}
-                {logsError ? (
+                        {runtimeBucketOptions.map((option) => (
+                          <option key={option} value={option}>
+                            {option >= 60 ? `${Math.round(option / 60)} min` : `${option} sec`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="flex items-center gap-1">
+                      Type
+                      <select
+                        className="rounded-lg border border-white/10 bg-slate-900/80 px-2 py-1 text-xs text-slate-200 focus:border-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+                        value={runtimeEventTypeFilter}
+                        onChange={(event: ChangeEvent<HTMLSelectElement>) =>
+                          handleRuntimeEventTypeFilterSelect(event.target.value as 'all' | string)
+                        }
+                      >
+                        <option value="all">All</option>
+                        {runtimeEventTypes.map((type) => (
+                          <option key={type} value={type}>
+                            {type}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleManualRuntimeMetricsRefresh}
+                      disabled={runtimeMetricsLoading || !state.activeProjectId}
+                      className="rounded-lg border border-cyan-500/50 px-3 py-1 font-semibold text-cyan-200 transition hover:border-cyan-400 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {runtimeMetricsLoading ? 'Refreshing…' : 'Refresh'}
+                    </button>
+                  </div>
+                </div>
+                {runtimeMetricsError ? (
                   <p className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
-                    {logsError}
+                    {runtimeMetricsError}
                   </p>
                 ) : null}
-                {state.logsHasMore ? (
-                  <button
-                    type="button"
-                    onClick={handleLoadMoreLogs}
-                    disabled={logsLoading}
-                    className="w-full rounded-xl border border-cyan-500/50 px-4 py-2 text-sm font-semibold text-cyan-200 transition hover:border-cyan-400 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {logsLoading ? 'Loading…' : `Load ${LOGS_PAGE_SIZE} more logs`}
-                  </button>
-                ) : state.logs.length > 0 ? (
-                  <p className="muted text-xs">Showing all available logs.</p>
-                ) : null}
+                {runtimeRollupsSorted.length > 0 ? (
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    <div className="rounded-2xl border border-white/10 bg-slate-900/70 p-4">
+                      <div className="flex items-center justify-between text-xs uppercase tracking-wide text-slate-400">
+                        <span>Latency P95</span>
+                        <span className="text-[11px] text-slate-500">
+                          {runtimeMetricsLoading ? 'Updating…' : 'Live'}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-2xl font-semibold text-white">
+                        {formatLatencyValue(runtimeSummary?.latest?.p95_ms ?? null)}
+                      </p>
+                      <p className="text-xs text-slate-400">
+                        Bucket started {formatTimestamp(runtimeSummary?.latest?.bucket_start)}
+                      </p>
+                      <div className="mt-3 h-16 w-full">
+                        <svg viewBox="0 0 160 48" className="h-full w-full text-cyan-300" preserveAspectRatio="none">
+                          <path
+                            d={latencySparklinePath || 'M0 48 L160 48'}
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            opacity={0.8}
+                          />
+                        </svg>
+                      </div>
+                    </div>
+                    <div className="rounded-2xl border border-white/10 bg-slate-900/70 p-4">
+                      <div className="flex items-center justify-between text-xs uppercase tracking-wide text-slate-400">
+                        <span>Throughput</span>
+                        <span className="text-[11px] text-slate-500">
+                          {runtimeSummary ? `${runtimeSummary.totalCount} total` : '—'}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-2xl font-semibold text-white">
+                        {formatRatePerSecond(
+                          runtimeSummary?.latest?.count ?? 0,
+                          runtimeSummary?.latest?.bucket_span_seconds ?? runtimeBucketSpan,
+                        )}
+                      </p>
+                      <p className="text-xs text-slate-400">
+                        {runtimeSummary?.latest
+                          ? `${runtimeSummary.latest.count} events in last bucket`
+                          : 'No buckets recorded.'}
+                      </p>
+                      <div className="mt-3 h-16 w-full">
+                        <svg viewBox="0 0 160 48" className="h-full w-full text-emerald-300" preserveAspectRatio="none">
+                          <path
+                            d={throughputSparklinePath || 'M0 48 L160 48'}
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            opacity={0.8}
+                          />
+                        </svg>
+                      </div>
+                    </div>
+                    <div className="rounded-2xl border border-white/10 bg-slate-900/70 p-4">
+                      <div className="flex items-center justify-between text-xs uppercase tracking-wide text-slate-400">
+                        <span>Error rate</span>
+                        <span className="text-[11px] text-slate-500">
+                          {runtimeSummary ? `${runtimeSummary.totalErrors} errors` : '—'}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-2xl font-semibold text-white">{formatPercent(runtimeSummary?.errorRate ?? 0)}</p>
+                      <p className="text-xs text-slate-400">
+                        {runtimeSummary?.latest
+                          ? `${runtimeSummary.latest.error_count} errors last bucket`
+                          : 'No error buckets recorded.'}
+                      </p>
+                      <div className="mt-3 flex items-center gap-2 text-[11px] text-slate-400">
+                        <span className={streamStatusBadgeClass(runtimeStreamStatus)}>runtime {runtimeStreamStatus}</span>
+                        <span className={streamStatusBadgeClass(logStreamStatus)}>builder {logStreamStatus}</span>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="rounded-2xl border border-dashed border-white/15 bg-slate-900/40 p-6 text-sm text-slate-300">
+                    {runtimeMetricsLoading
+                      ? 'Collecting runtime metrics…'
+                      : 'Runtime metrics will appear once telemetry events arrive.'}
+                  </div>
+                )}
+              </section>
+              <section className="space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-white">Activity</h3>
+                    <p className="text-xs text-slate-400">Inspect live runtime telemetry alongside build outputs.</p>
+                  </div>
+                  <div className="flex items-center gap-1 rounded-full border border-white/10 bg-slate-900/60 p-1">
+                    <button
+                      type="button"
+                      onClick={() => setInsightTab('runtime')}
+                      className={`rounded-full px-3 py-1 text-xs font-semibold transition ${
+                        insightTab === 'runtime'
+                          ? 'bg-cyan-500 text-slate-950 shadow'
+                          : 'text-slate-300 hover:text-white'
+                      }`}
+                    >
+                      Runtime
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setInsightTab('build')}
+                      className={`rounded-full px-3 py-1 text-xs font-semibold transition ${
+                        insightTab === 'build'
+                          ? 'bg-emerald-500 text-slate-950 shadow'
+                          : 'text-slate-300 hover:text-white'
+                      }`}
+                    >
+                      Build logs
+                    </button>
+                  </div>
+                </div>
+                <AnimatePresence mode="wait" initial={false}>
+                  {insightTab === 'runtime' ? (
+                    <motion.div
+                      key="runtime"
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -8 }}
+                      transition={{ duration: 0.2 }}
+                      className="space-y-3"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="min-w-[200px] flex-1">
+                          <input
+                            className="w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 focus:border-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+                            placeholder="Search message, path, metadata…"
+                            value={runtimeSearchTerm}
+                            onChange={(event: ChangeEvent<HTMLInputElement>) => setRuntimeSearchTerm(event.target.value)}
+                          />
+                        </div>
+                        <select
+                          className="rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-xs text-slate-200 focus:border-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+                          value={runtimeLevelFilter}
+                          onChange={(event: ChangeEvent<HTMLSelectElement>) =>
+                            setRuntimeLevelFilter(event.target.value as (typeof runtimeLevelOptions)[number] | 'all')
+                          }
+                        >
+                          <option value="all">All levels</option>
+                          {runtimeLevelOptions.map((level) => (
+                            <option key={level} value={level}>
+                              {level}
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          className="rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-xs text-slate-200 focus:border-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+                          value={runtimeMethodFilter}
+                          onChange={(event: ChangeEvent<HTMLSelectElement>) =>
+                            setRuntimeMethodFilter(event.target.value as 'all' | string)
+                          }
+                        >
+                          <option value="all">All methods</option>
+                          {runtimeMethodOptions.map((method) => (
+                            <option key={method} value={method}>
+                              {method}
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          className="rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-xs text-slate-200 focus:border-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+                          value={runtimeSourceFilter}
+                          onChange={(event: ChangeEvent<HTMLSelectElement>) =>
+                            setRuntimeSourceFilter(event.target.value as 'all' | string)
+                          }
+                        >
+                          <option value="all">All sources</option>
+                          {runtimeSourceOptions.map((source) => (
+                            <option key={source} value={source}>
+                              {source}
+                            </option>
+                          ))}
+                        </select>
+                        <span className="text-xs text-slate-400">
+                          {filteredRuntimeEvents.length} shown · {state.runtimeEvents.length} total
+                        </span>
+                      </div>
+                      {filteredRuntimeEvents.length > 0 ? (
+                        <ul className="space-y-2">
+                          {filteredRuntimeEvents.map((event) => (
+                            <li
+                              key={`${event.id}-${event.ingested_at}`}
+                              className="space-y-2 rounded-xl border border-white/10 bg-slate-900/70 p-3 text-sm text-slate-200"
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+                                <span className="font-semibold uppercase text-slate-200">{event.level || 'info'}</span>
+                                <span>{formatTimestamp(event.occurred_at)}</span>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-3 text-xs font-mono text-slate-300">
+                                <span>{(event.method || '—').toUpperCase()}</span>
+                                <span className="break-all text-slate-200">{event.path || '/'}</span>
+                                <span>Status {event.status_code ?? '—'}</span>
+                                <span>{formatLatencyValue(event.latency_ms)}</span>
+                              </div>
+                              <p className="text-sm text-slate-100">{event.message}</p>
+                              <div className="flex flex-wrap items-center gap-3 text-[11px] uppercase tracking-wide text-slate-500">
+                                <span>Source: {event.source || 'runtime'}</span>
+                                <span>Type: {event.event_type || '—'}</span>
+                                <span>ID {formatId(event.project_id, 10)}</span>
+                              </div>
+                              {event.metadata ? (
+                                <pre className="whitespace-pre-wrap rounded-xl bg-slate-950/60 p-2 text-[11px] text-slate-300">
+                                  {JSON.stringify(event.metadata, null, 2)}
+                                </pre>
+                              ) : null}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="muted">No runtime events match the current filters.</p>
+                      )}
+                      {runtimeEventsError ? (
+                        <p className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+                          {runtimeEventsError}
+                        </p>
+                      ) : null}
+                      {state.runtimeEventsHasMore ? (
+                        <button
+                          type="button"
+                          onClick={handleLoadMoreRuntimeEvents}
+                          disabled={runtimeEventsLoading}
+                          className="w-full rounded-xl border border-cyan-500/50 px-4 py-2 text-sm font-semibold text-cyan-200 transition hover:border-cyan-400 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {runtimeEventsLoading ? 'Loading…' : `Load ${RUNTIME_EVENTS_PAGE_SIZE} more events`}
+                        </button>
+                      ) : state.runtimeEvents.length > 0 ? (
+                        <p className="muted text-xs">Showing all available runtime events.</p>
+                      ) : null}
+                    </motion.div>
+                  ) : (
+                    <motion.div
+                      key="build"
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -8 }}
+                      transition={{ duration: 0.2 }}
+                      className="space-y-3"
+                    >
+                      {state.logs.length > 0 ? (
+                        <ul className="space-y-2">
+                          {state.logs.map((log) => (
+                            <li
+                              key={`${log.id}-${log.created_at}`}
+                              className="space-y-2 rounded-xl border border-white/10 bg-slate-900/70 p-3 text-sm text-slate-200"
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+                                <span className="font-semibold uppercase text-slate-200">{log.level}</span>
+                                <span>{formatTimestamp(log.created_at)}</span>
+                              </div>
+                              <p className="text-sm text-slate-100">{log.message}</p>
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] uppercase tracking-wide text-slate-500">
+                                <span>Source: {log.source || 'n/a'}</span>
+                                <span>ID {formatId(log.project_id, 10)}</span>
+                              </div>
+                              {log.metadata ? (
+                                <pre className="whitespace-pre-wrap rounded-xl bg-slate-950/60 p-2 text-[11px] text-slate-300">
+                                  {JSON.stringify(log.metadata, null, 2)}
+                                </pre>
+                              ) : null}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="muted">No build logs available for this project.</p>
+                      )}
+                      {logsError ? (
+                        <p className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+                          {logsError}
+                        </p>
+                      ) : null}
+                      {state.logsHasMore ? (
+                        <button
+                          type="button"
+                          onClick={handleLoadMoreLogs}
+                          disabled={logsLoading}
+                          className="w-full rounded-xl border border-cyan-500/50 px-4 py-2 text-sm font-semibold text-cyan-200 transition hover:border-cyan-400 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {logsLoading ? 'Loading…' : `Load ${LOGS_PAGE_SIZE} more logs`}
+                        </button>
+                      ) : state.logs.length > 0 ? (
+                        <p className="muted text-xs">Showing all available builder logs.</p>
+                      ) : null}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </section>
             </div>
           ) : null}
