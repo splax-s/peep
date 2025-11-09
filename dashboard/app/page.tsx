@@ -4,7 +4,9 @@ import {
   ApiError,
   getProject,
   listDeployments,
-  listEnvVars,
+  listEnvironments,
+  listEnvironmentAudits,
+  listEnvironmentVersions,
   listLogs,
   listProjects,
   listRuntimeEvents,
@@ -13,6 +15,8 @@ import {
 } from '@/lib/api';
 import {
   DEPLOYMENTS_LIMIT,
+  ENVIRONMENT_AUDIT_LIMIT,
+  ENVIRONMENT_VERSIONS_LIMIT,
   LOGS_PAGE_SIZE,
   RUNTIME_EVENTS_PAGE_SIZE,
   RUNTIME_METRIC_BUCKET_SECONDS,
@@ -68,29 +72,59 @@ export default async function DashboardPage({ searchParams }: PageProps) {
     const activeProjectId = projects.some((project) => project.id === projectFromQuery)
       ? projectFromQuery
       : projects[0]?.id ?? null;
-    const [project, envVars, deployments, logs, runtimeRollups, runtimeEvents] = activeProjectId
-      ? await Promise.all([
-          getProject(session.tokens.AccessToken, activeProjectId),
-          listEnvVars(session.tokens.AccessToken, activeProjectId),
-          listDeployments(session.tokens.AccessToken, activeProjectId, DEPLOYMENTS_LIMIT),
-          listLogs(session.tokens.AccessToken, activeProjectId, LOGS_PAGE_SIZE, 0),
-          listRuntimeRollups(session.tokens.AccessToken, activeProjectId, {
-            bucketSpanSeconds: RUNTIME_METRIC_BUCKET_SECONDS,
-            limit: RUNTIME_METRICS_LIMIT,
+    const environmentParam = params?.environment;
+    const environmentFromQuery = typeof environmentParam === 'string' ? environmentParam : null;
+
+    let project: Awaited<ReturnType<typeof getProject>> | null = null;
+    let environments: Awaited<ReturnType<typeof listEnvironments>> = [];
+    let activeEnvironmentId: string | null = null;
+    let environmentVersions: Awaited<ReturnType<typeof listEnvironmentVersions>> = [];
+    let environmentAudits: Awaited<ReturnType<typeof listEnvironmentAudits>> = [];
+    let deployments: Awaited<ReturnType<typeof listDeployments>> = [];
+    let logs: Awaited<ReturnType<typeof listLogs>> = [];
+    let runtimeRollups: Awaited<ReturnType<typeof listRuntimeRollups>> = [];
+    let runtimeEvents: Awaited<ReturnType<typeof listRuntimeEvents>> = [];
+
+    if (activeProjectId) {
+      [project, environments, deployments, logs, runtimeRollups, runtimeEvents] = await Promise.all([
+        getProject(session.tokens.AccessToken, activeProjectId),
+        listEnvironments(session.tokens.AccessToken, activeProjectId),
+        listDeployments(session.tokens.AccessToken, activeProjectId, DEPLOYMENTS_LIMIT),
+        listLogs(session.tokens.AccessToken, activeProjectId, LOGS_PAGE_SIZE, 0),
+        listRuntimeRollups(session.tokens.AccessToken, activeProjectId, {
+          bucketSpanSeconds: RUNTIME_METRIC_BUCKET_SECONDS,
+          limit: RUNTIME_METRICS_LIMIT,
+        }),
+        listRuntimeEvents(session.tokens.AccessToken, activeProjectId, {
+          limit: RUNTIME_EVENTS_PAGE_SIZE,
+          offset: 0,
+        }),
+      ]);
+
+      activeEnvironmentId = environments.some((candidate) => candidate.environment.id === environmentFromQuery)
+        ? environmentFromQuery
+        : environments[0]?.environment.id ?? null;
+
+      if (activeEnvironmentId) {
+        [environmentVersions, environmentAudits] = await Promise.all([
+          listEnvironmentVersions(
+            session.tokens.AccessToken,
+            activeProjectId,
+            activeEnvironmentId,
+            ENVIRONMENT_VERSIONS_LIMIT,
+          ),
+          listEnvironmentAudits(session.tokens.AccessToken, activeProjectId, {
+            environmentId: activeEnvironmentId,
+            limit: ENVIRONMENT_AUDIT_LIMIT,
           }),
-          listRuntimeEvents(session.tokens.AccessToken, activeProjectId, {
-            limit: RUNTIME_EVENTS_PAGE_SIZE,
-            offset: 0,
-          }),
-        ])
-      : [
-          null,
-          [] as Awaited<ReturnType<typeof listEnvVars>>,
-          [] as Awaited<ReturnType<typeof listDeployments>>,
-          [] as Awaited<ReturnType<typeof listLogs>>,
-          [] as Awaited<ReturnType<typeof listRuntimeRollups>>,
-          [] as Awaited<ReturnType<typeof listRuntimeEvents>>,
-        ];
+        ]);
+      } else {
+        environmentAudits = await listEnvironmentAudits(session.tokens.AccessToken, activeProjectId, {
+          limit: ENVIRONMENT_AUDIT_LIMIT,
+        });
+      }
+    }
+
     const logsHasMore = activeProjectId ? logs.length === LOGS_PAGE_SIZE : false;
     const deploymentsHasMore = activeProjectId ? deployments.length === DEPLOYMENTS_LIMIT : false;
     const runtimeEventsHasMore = activeProjectId ? runtimeEvents.length === RUNTIME_EVENTS_PAGE_SIZE : false;
@@ -104,7 +138,10 @@ export default async function DashboardPage({ searchParams }: PageProps) {
           projects={projects}
           activeProjectId={activeProjectId}
           project={project}
-          envVars={envVars}
+          environments={environments}
+          activeEnvironmentId={activeEnvironmentId}
+          environmentVersions={environmentVersions}
+          environmentAudits={environmentAudits}
           deployments={deployments}
           logs={logs}
           logsHasMore={logsHasMore}

@@ -1,14 +1,23 @@
 import type {
+  CreateEnvironmentInput,
+  CreateEnvironmentVersionInput,
   CreateProjectInput,
   CreateTeamInput,
   Deployment,
+  Environment,
+  EnvironmentAudit,
+  EnvironmentDetails,
+  EnvironmentVersion,
+  EnvironmentVersionDetails,
+  EnvironmentVariable,
+  EnvironmentVariableInput,
   Project,
-  ProjectEnvVar,
   ProjectLog,
-  SessionPayload,
   RuntimeEvent,
   RuntimeMetricRollup,
+  SessionPayload,
   Team,
+  UpdateEnvironmentInput,
 } from '@/types';
 
 interface RawTeam {
@@ -32,10 +41,64 @@ interface RawProject {
   CreatedAt: string;
 }
 
-interface RawEnvVar {
+interface RawEnvironment {
+  ID: string;
   ProjectID: string;
+  Slug: string;
+  Name: string;
+  EnvironmentType: string;
+  Protected: boolean;
+  Position: number;
+  CreatedAt: string;
+  UpdatedAt: string;
+}
+
+interface RawEnvironmentVariable {
   Key: string;
   Value: string;
+  Checksum?: string | null;
+}
+
+interface RawEnvironmentVersion {
+  ID: string;
+  EnvironmentID: string;
+  Version: number;
+  Description: string;
+  CreatedBy: string | null;
+  CreatedAt: string;
+}
+
+interface RawEnvironmentVersionDetails {
+  Version: RawEnvironmentVersion;
+  Variables: RawEnvironmentVariable[];
+}
+
+interface RawEnvironmentDetails {
+  Environment: RawEnvironment;
+  LatestVersion?: RawEnvironmentVersionDetails | null;
+}
+
+interface RawEnvironmentAudit {
+  ID: number;
+  ProjectID: string;
+  EnvironmentID: string | null;
+  VersionID: string | null;
+  ActorID: string | null;
+  Action: string;
+  Metadata: unknown;
+  CreatedAt: string;
+}
+
+function sanitizeUUID(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const match = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(trimmed);
+  return match ? trimmed : null;
 }
 
 interface RawDeployment {
@@ -123,10 +186,69 @@ function normalizeProject(raw: RawProject): Project {
   };
 }
 
-function normalizeEnvVar(raw: RawEnvVar): ProjectEnvVar {
+function normalizeEnvironment(raw: RawEnvironment): Environment {
+  return {
+    id: raw.ID,
+    project_id: raw.ProjectID,
+    slug: raw.Slug,
+    name: raw.Name,
+    environment_type: raw.EnvironmentType,
+    protected: raw.Protected,
+    position: raw.Position,
+    created_at: raw.CreatedAt,
+    updated_at: raw.UpdatedAt,
+  };
+}
+
+function normalizeEnvironmentVariable(raw: RawEnvironmentVariable): EnvironmentVariable {
   return {
     key: raw.Key,
     value: raw.Value,
+    checksum: raw.Checksum ?? null,
+  };
+}
+
+function normalizeEnvironmentVersion(raw: RawEnvironmentVersion): EnvironmentVersion {
+  return {
+    id: raw.ID,
+    environment_id: raw.EnvironmentID,
+    version: raw.Version,
+    description: raw.Description,
+    created_by: raw.CreatedBy ?? null,
+    created_at: raw.CreatedAt,
+  };
+}
+
+function normalizeEnvironmentVersionDetails(raw?: RawEnvironmentVersionDetails | null): EnvironmentVersionDetails | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  return {
+    version: normalizeEnvironmentVersion(raw.Version),
+    variables: Array.isArray(raw.Variables) ? raw.Variables.map(normalizeEnvironmentVariable) : [],
+  };
+}
+
+function normalizeEnvironmentDetails(raw?: RawEnvironmentDetails | null): EnvironmentDetails | null {
+  if (!raw || !raw.Environment) {
+    return null;
+  }
+  return {
+    environment: normalizeEnvironment(raw.Environment),
+    latest_version: normalizeEnvironmentVersionDetails(raw.LatestVersion),
+  };
+}
+
+function normalizeEnvironmentAudit(raw: RawEnvironmentAudit): EnvironmentAudit {
+  return {
+    id: raw.ID,
+    project_id: raw.ProjectID,
+    environment_id: raw.EnvironmentID,
+    version_id: raw.VersionID,
+    actor_id: raw.ActorID,
+    action: raw.Action,
+    metadata: parseMetadata(raw.Metadata),
+    created_at: raw.CreatedAt,
   };
 }
 
@@ -221,7 +343,13 @@ function normalizeRuntimeEvent(raw: RawRuntimeEvent): RuntimeEvent {
 }
 
 const globalProcess = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
-export const API_BASE_URL = globalProcess?.env?.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+const DEFAULT_API_BASE_URL = 'http://localhost:4000';
+const serverApiBase =
+  globalProcess?.env?.API_INTERNAL_BASE_URL ??
+  globalProcess?.env?.NEXT_PUBLIC_API_BASE_URL ??
+  DEFAULT_API_BASE_URL;
+const clientApiBase = globalProcess?.env?.NEXT_PUBLIC_API_BASE_URL ?? DEFAULT_API_BASE_URL;
+export const API_BASE_URL = typeof window === 'undefined' ? serverApiBase : clientApiBase;
 
 export class ApiError extends Error {
   public readonly status: number;
@@ -330,28 +458,198 @@ export async function getProject(accessToken: string, projectId: string): Promis
   return normalizeProject(project);
 }
 
-export async function listEnvVars(accessToken: string, projectId: string): Promise<ProjectEnvVar[]> {
-  const envVars = await request<RawEnvVar[] | null>(`/projects/${encodeURIComponent(projectId)}/env`, {
+export async function listEnvironments(accessToken: string, projectId: string): Promise<EnvironmentDetails[]> {
+  const environments = await request<RawEnvironmentDetails[]>(`/projects/${encodeURIComponent(projectId)}/environments`, {
     method: 'GET',
     headers: authHeaders(accessToken),
   });
-  if (!Array.isArray(envVars)) {
-    return [];
-  }
-  return envVars.map(normalizeEnvVar);
+  return environments
+    .map((entry) => normalizeEnvironmentDetails(entry))
+    .filter((detail): detail is EnvironmentDetails => detail !== null);
 }
 
-export async function addEnvVar(
+export async function createEnvironment(
   accessToken: string,
   projectId: string,
-  key: string,
-  value: string,
-): Promise<{ status: string }> {
-  return request<{ status: string }>(`/projects/${encodeURIComponent(projectId)}/env`, {
+  input: CreateEnvironmentInput,
+): Promise<EnvironmentDetails> {
+  const payload: Record<string, unknown> = {
+    name: input.name.trim(),
+  };
+  if (input.slug) {
+    payload.slug = input.slug.trim();
+  }
+  if (input.type) {
+    payload.type = input.type.trim();
+  }
+  if (typeof input.protected === 'boolean') {
+    payload.protected = input.protected;
+  }
+  if (typeof input.position === 'number' && Number.isFinite(input.position)) {
+    payload.position = input.position;
+  }
+
+  const detail = await request<RawEnvironmentDetails>(`/projects/${encodeURIComponent(projectId)}/environments`, {
     method: 'POST',
     headers: authHeaders(accessToken),
-    body: JSON.stringify({ ProjectID: projectId, Key: key, Value: value }),
+    body: JSON.stringify(payload),
   });
+  const normalized = normalizeEnvironmentDetails(detail);
+  if (!normalized) {
+    throw new Error('environment payload missing from API response');
+  }
+  return normalized;
+}
+
+export async function updateEnvironment(
+  accessToken: string,
+  projectId: string,
+  environmentId: string,
+  input: UpdateEnvironmentInput,
+): Promise<EnvironmentDetails> {
+  const payload: Record<string, unknown> = {};
+  if (typeof input.name === 'string') {
+    payload.name = input.name.trim();
+  }
+  if (typeof input.slug === 'string') {
+    payload.slug = input.slug.trim();
+  }
+  if (typeof input.type === 'string') {
+    payload.type = input.type.trim();
+  }
+  if (typeof input.protected === 'boolean') {
+    payload.protected = input.protected;
+  }
+  if (typeof input.position === 'number' && Number.isFinite(input.position)) {
+    payload.position = input.position;
+  }
+
+  const detail = await request<RawEnvironmentDetails>(
+    `/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(environmentId)}`,
+    {
+      method: 'PATCH',
+      headers: authHeaders(accessToken),
+      body: JSON.stringify(payload),
+    },
+  );
+  const normalized = normalizeEnvironmentDetails(detail);
+  if (!normalized) {
+    throw new Error('environment payload missing from API response');
+  }
+  return normalized;
+}
+
+export async function listEnvironmentVersions(
+  accessToken: string,
+  projectId: string,
+  environmentId: string,
+  limit?: number,
+): Promise<EnvironmentVersion[]> {
+  const search = new URLSearchParams();
+  if (typeof limit === 'number' && limit > 0) {
+    search.set('limit', String(limit));
+  }
+  const suffix = search.size ? `?${search.toString()}` : '';
+  const versions = await request<RawEnvironmentVersion[] | null>(
+    `/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(environmentId)}/versions${suffix}`,
+    {
+      method: 'GET',
+      headers: authHeaders(accessToken),
+    },
+  );
+  if (!Array.isArray(versions)) {
+    return [];
+  }
+  return versions.map(normalizeEnvironmentVersion);
+}
+
+export async function createEnvironmentVersion(
+  accessToken: string,
+  projectId: string,
+  environmentId: string,
+  input: CreateEnvironmentVersionInput,
+): Promise<EnvironmentVersionDetails> {
+  const variables = Array.isArray(input.variables)
+    ? input.variables
+        .filter((variable): variable is EnvironmentVariableInput =>
+          typeof variable?.key === 'string' && typeof variable?.value === 'string',
+        )
+        .map((variable) => ({
+          key: variable.key,
+          value: variable.value,
+        }))
+    : [];
+
+  const payload = {
+    description: input.description?.trim() ?? '',
+    variables,
+  };
+
+  const raw = await request<RawEnvironmentVersionDetails>(
+    `/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(environmentId)}/versions`,
+    {
+      method: 'POST',
+      headers: authHeaders(accessToken),
+      body: JSON.stringify(payload),
+    },
+  );
+  const detail = normalizeEnvironmentVersionDetails(raw);
+  if (!detail) {
+    throw new ApiError('Invalid environment version response.', 502, raw);
+  }
+  return detail;
+}
+
+export async function getEnvironmentVersion(
+  accessToken: string,
+  projectId: string,
+  environmentId: string,
+  versionId: string,
+): Promise<EnvironmentVersionDetails> {
+  const raw = await request<RawEnvironmentVersionDetails>(
+    `/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(environmentId)}/versions/${encodeURIComponent(versionId)}`,
+    {
+      method: 'GET',
+      headers: authHeaders(accessToken),
+    },
+  );
+  const detail = normalizeEnvironmentVersionDetails(raw);
+  if (!detail) {
+    throw new ApiError('Invalid environment version response.', 502, raw);
+  }
+  return detail;
+}
+
+export interface EnvironmentAuditQuery {
+  environmentId?: string;
+  limit?: number;
+}
+
+export async function listEnvironmentAudits(
+  accessToken: string,
+  projectId: string,
+  query: EnvironmentAuditQuery = {},
+): Promise<EnvironmentAudit[]> {
+  const search = new URLSearchParams();
+  const environmentId = sanitizeUUID(query.environmentId ?? null);
+  if (environmentId) {
+    search.set('environment_id', environmentId);
+  }
+  if (typeof query.limit === 'number' && query.limit > 0) {
+    search.set('limit', String(query.limit));
+  }
+  const suffix = search.size ? `?${search.toString()}` : '';
+  const audits = await request<RawEnvironmentAudit[] | null>(
+    `/projects/${encodeURIComponent(projectId)}/environments/audits${suffix}`,
+    {
+      method: 'GET',
+      headers: authHeaders(accessToken),
+    },
+  );
+  if (!Array.isArray(audits)) {
+    return [];
+  }
+  return audits.map(normalizeEnvironmentAudit);
 }
 
 export async function listDeployments(accessToken: string, projectId: string, limit = 10): Promise<Deployment[]> {

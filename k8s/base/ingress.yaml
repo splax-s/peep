@@ -1,0 +1,49 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: peep
+  namespace: peep
+  labels:
+    app.kubernetes.io/name: peep
+    app.kubernetes.io/component: ingress
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "25m"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: peep.com
+      http:
+        paths:
+          - path: /api/dashboard(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: dashboard
+                port:
+                  name: http
+          - path: /api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dashboard
+                port:
+                  name: http
+          - path: /builder
+            pathType: Prefix
+            backend:
+              service:
+                name: builder
+                port:
+                  name: http
+  tls:
+    - hosts:
+        - peep.com
+      secretName: peep-tls

@@ -1,8 +1,17 @@
 'use server';
 
 import { revalidatePath } from 'next/cache';
-import { ApiError, addEnvVar, createProject, createTeam, deleteDeployment, triggerDeployment } from '@/lib/api';
+import {
+  ApiError,
+  createEnvironment,
+  createEnvironmentVersion,
+  createProject,
+  createTeam,
+  deleteDeployment,
+  triggerDeployment,
+} from '@/lib/api';
 import { getSession } from '@/lib/session';
+import type { EnvironmentVariableInput } from '@/types';
 
 export interface ActionResponse {
   success: boolean;
@@ -25,10 +34,20 @@ export interface CreateProjectActionInput {
   runCommand: string;
 }
 
-export interface AddEnvVarActionInput {
+export interface CreateEnvironmentActionInput {
   projectId: string;
-  key: string;
-  value: string;
+  name: string;
+  slug?: string;
+  type?: string;
+  protected?: boolean;
+  position?: number;
+}
+
+export interface CreateEnvironmentVersionActionInput {
+  projectId: string;
+  environmentId: string;
+  description?: string;
+  variables: EnvironmentVariableInput[];
 }
 
 export interface TriggerDeploymentActionInput {
@@ -38,6 +57,14 @@ export interface TriggerDeploymentActionInput {
 
 export interface DeleteDeploymentActionInput {
   deploymentId: string;
+}
+
+export interface CreateEnvironmentActionResponse extends ActionResponse {
+  environmentId?: string;
+}
+
+export interface CreateEnvironmentVersionActionResponse extends ActionResponse {
+  versionId?: string;
 }
 
 function formatError(error: unknown): string {
@@ -116,32 +143,80 @@ export async function createProjectAction(input: CreateProjectActionInput): Prom
   }
 }
 
-export async function addEnvVarAction(input: AddEnvVarActionInput): Promise<ActionResponse> {
+export async function createEnvironmentAction(input: CreateEnvironmentActionInput): Promise<CreateEnvironmentActionResponse> {
   const session = await getSession();
   if (!session) {
     return { success: false, error: 'Not authenticated.' };
   }
 
   const projectId = input.projectId.trim();
-  const key = input.key.trim().toUpperCase();
-  const value = input.value.trim();
+  const name = input.name.trim();
+  const slug = input.slug?.trim();
+  const type = input.type?.trim();
+  const position = typeof input.position === 'number' && Number.isFinite(input.position) ? input.position : undefined;
 
   if (!projectId) {
-    return { success: false, error: 'Select a project before adding secrets.' };
+    return { success: false, error: 'Select a project before creating environments.' };
   }
 
-  if (!key) {
-    return { success: false, error: 'Key is required.' };
-  }
-
-  if (!value) {
-    return { success: false, error: 'Value is required.' };
+  if (!name) {
+    return { success: false, error: 'Environment name is required.' };
   }
 
   try {
-    await addEnvVar(session.tokens.AccessToken, projectId, key, value);
+    const detail = await createEnvironment(session.tokens.AccessToken, projectId, {
+      name,
+      slug,
+      type,
+      protected: input.protected,
+      position,
+    });
     revalidatePath('/');
-    return { success: true };
+    return { success: true, environmentId: detail.environment.id };
+  } catch (error) {
+    return { success: false, error: formatError(error) };
+  }
+}
+
+export async function createEnvironmentVersionAction(
+  input: CreateEnvironmentVersionActionInput,
+): Promise<CreateEnvironmentVersionActionResponse> {
+  const session = await getSession();
+  if (!session) {
+    return { success: false, error: 'Not authenticated.' };
+  }
+
+  const projectId = input.projectId.trim();
+  const environmentId = input.environmentId.trim();
+
+  if (!projectId) {
+    return { success: false, error: 'Select a project before publishing a version.' };
+  }
+
+  if (!environmentId) {
+    return { success: false, error: 'Select an environment before publishing a version.' };
+  }
+
+  const variables = Array.isArray(input.variables)
+    ? input.variables
+        .map((variable) => ({
+          key: variable.key.trim().toUpperCase(),
+          value: variable.value.trim(),
+        }))
+        .filter((variable) => variable.key.length > 0)
+    : [];
+
+  if (variables.length === 0) {
+    return { success: false, error: 'Provide at least one variable to publish a version.' };
+  }
+
+  try {
+    const detail = await createEnvironmentVersion(session.tokens.AccessToken, projectId, environmentId, {
+      description: input.description,
+      variables,
+    });
+    revalidatePath('/');
+    return { success: true, versionId: detail.version.id };
   } catch (error) {
     return { success: false, error: formatError(error) };
   }

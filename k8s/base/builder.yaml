@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: builder
+  namespace: peep
+  labels:
+    app.kubernetes.io/name: builder
+    app.kubernetes.io/component: backend
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: builder
+    app.kubernetes.io/component: backend
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: builder
+  namespace: peep
+  labels:
+    app.kubernetes.io/name: builder
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: builder
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: builder
+        app.kubernetes.io/component: backend
+    spec:
+      serviceAccountName: builder
+      containers:
+        - name: builder
+          image: peep/builder:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5000
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+          envFrom:
+            - configMapRef:
+                name: builder-config
+            - secretRef:
+                name: builder-env
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: workdir
+              mountPath: /tmp/peep
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+      volumes:
+        - name: workdir
+          emptyDir: {}
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: builder
+  namespace: peep
+  labels:
+    app.kubernetes.io/name: builder
+    app.kubernetes.io/component: backend

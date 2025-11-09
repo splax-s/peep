@@ -25,6 +25,7 @@ import (
 	"github.com/splax/localvercel/api/internal/repository"
 	"github.com/splax/localvercel/api/internal/service/auth"
 	"github.com/splax/localvercel/api/internal/service/deploy"
+	"github.com/splax/localvercel/api/internal/service/environment"
 	"github.com/splax/localvercel/api/internal/service/logs"
 	"github.com/splax/localvercel/api/internal/service/project"
 	runtimeSvc "github.com/splax/localvercel/api/internal/service/runtime"
@@ -40,6 +41,7 @@ type Router struct {
 	auth               auth.Service
 	team               team.Service
 	project            project.Service
+	environment        environment.Service
 	deploy             deploy.Service
 	logs               logs.Service
 	runtime            *runtimeSvc.TelemetryService
@@ -58,15 +60,15 @@ type Router struct {
 const (
 	rateWindowDefault          = time.Minute
 	rateWindowRealtime         = 30 * time.Second
-	rateLimitSignup            = 5
-	rateLimitLogin             = 12
-	rateLimitUserWrite         = 60
-	rateLimitUserRead          = 120
-	rateLimitWebsocket         = 30
-	rateLimitBuilderCallback   = 60
-	rateLimitBuilderWrite      = 600
-	rateLimitRuntimeWrite      = 1000
-	rateLimitRuntimeRead       = 240
+	rateLimitSignup            = 300
+	rateLimitLogin             = 900
+	rateLimitUserWrite         = 6000
+	rateLimitUserRead          = 12000
+	rateLimitWebsocket         = 2400
+	rateLimitBuilderCallback   = 4000
+	rateLimitBuilderWrite      = 20000
+	rateLimitRuntimeWrite      = 64000
+	rateLimitRuntimeRead       = 9600
 	runtimeStreamHeartbeat     = 20 * time.Second
 	runtimeStreamWatchdog      = 2 * runtimeStreamHeartbeat
 	runtimeStreamBackfillLimit = 100
@@ -77,17 +79,18 @@ const (
 )
 
 // NewRouter assembles routes with dependencies.
-func NewRouter(logger *slog.Logger, authSvc auth.Service, teamSvc team.Service, projectSvc project.Service, deploySvc deploy.Service, logSvc logs.Service, runtimeTelemetry *runtimeSvc.TelemetryService, webhookSvc webhook.Service, limiter RateLimiter, builderToken string, dbHealth func(context.Context) error) *Router {
+func NewRouter(logger *slog.Logger, authSvc auth.Service, teamSvc team.Service, projectSvc project.Service, environmentSvc environment.Service, deploySvc deploy.Service, logSvc logs.Service, runtimeTelemetry *runtimeSvc.TelemetryService, webhookSvc webhook.Service, limiter RateLimiter, builderToken string, dbHealth func(context.Context) error) *Router {
 	r := &Router{
-		mux:     http.NewServeMux(),
-		logger:  logger,
-		auth:    authSvc,
-		team:    teamSvc,
-		project: projectSvc,
-		deploy:  deploySvc,
-		logs:    logSvc,
-		runtime: runtimeTelemetry,
-		webhook: webhookSvc,
+		mux:         http.NewServeMux(),
+		logger:      logger,
+		auth:        authSvc,
+		team:        teamSvc,
+		project:     projectSvc,
+		environment: environmentSvc,
+		deploy:      deploySvc,
+		logs:        logSvc,
+		runtime:     runtimeTelemetry,
+		webhook:     webhookSvc,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
@@ -285,12 +288,12 @@ func (r *Router) handleProjectSubroutes(w http.ResponseWriter, req *http.Request
 		r.notFound(w)
 		return
 	}
-	if len(parts) == 1 {
+	if len(parts) == 1 || parts[1] == "" {
 		r.handleProjectResource(w, req, projectID)
 		return
 	}
-	if len(parts) == 2 && parts[1] == "env" {
-		r.handleProjectEnv(w, req, projectID)
+	if parts[1] == "environments" {
+		r.handleProjectEnvironments(w, req, projectID, parts[2:])
 		return
 	}
 	r.notFound(w)
@@ -319,39 +322,323 @@ func (r *Router) handleProjectResource(w http.ResponseWriter, req *http.Request,
 	}
 }
 
-func (r *Router) handleProjectEnv(w http.ResponseWriter, req *http.Request, projectID string) {
+func (r *Router) handleProjectEnvironments(w http.ResponseWriter, req *http.Request, projectID string, segments []string) {
+	if _, ok := authInfoFromContext(req.Context()); !ok {
+		r.logger.Error("auth context missing for environment route", "path", req.URL.Path)
+		writeError(w, http.StatusInternalServerError, "authorization context missing")
+		return
+	}
+	if len(segments) == 0 || segments[0] == "" {
+		r.handleEnvironmentsCollection(w, req, projectID)
+		return
+	}
+	if segments[0] == "audits" {
+		r.handleEnvironmentAudits(w, req, projectID)
+		return
+	}
+	environmentID := strings.TrimSpace(segments[0])
+	if environmentID == "" {
+		r.notFound(w)
+		return
+	}
+	if len(segments) == 1 || segments[1] == "" {
+		r.handleEnvironmentResource(w, req, projectID, environmentID)
+		return
+	}
+	if segments[1] == "versions" {
+		r.handleEnvironmentVersions(w, req, projectID, environmentID, segments[2:])
+		return
+	}
+	r.notFound(w)
+}
+
+func (r *Router) handleEnvironmentsCollection(w http.ResponseWriter, req *http.Request, projectID string) {
 	switch req.Method {
+	case http.MethodGet:
+		environments, err := r.environment.List(req.Context(), projectID)
+		if err != nil {
+			r.respondEnvironmentError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, environments)
 	case http.MethodPost:
-		var payload project.EnvVarInput
-		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		var payload struct {
+			Name            string  `json:"name"`
+			Slug            string  `json:"slug"`
+			Type            string  `json:"type"`
+			Protected       *bool   `json:"protected"`
+			Position        *int    `json:"position"`
+			ActorIDOverride *string `json:"actor_id"`
+		}
+		decoder := json.NewDecoder(req.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&payload); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
-		if _, ok := authInfoFromContext(req.Context()); !ok {
-			r.logger.Error("auth context missing for env var mutation", "path", req.URL.Path)
-			writeError(w, http.StatusInternalServerError, "authorization context missing")
-			return
+		info, _ := authInfoFromContext(req.Context())
+		var actorID *string
+		if payload.ActorIDOverride != nil && strings.TrimSpace(*payload.ActorIDOverride) != "" {
+			override := strings.TrimSpace(*payload.ActorIDOverride)
+			actorID = &override
+		} else if strings.TrimSpace(info.UserID) != "" {
+			user := strings.TrimSpace(info.UserID)
+			actorID = &user
 		}
-		payload.ProjectID = projectID
-		if err := r.project.AddEnvVar(req.Context(), payload); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
+		protected := false
+		if payload.Protected != nil {
+			protected = *payload.Protected
 		}
-		writeJSON(w, http.StatusCreated, map[string]string{"status": "stored"})
-	case http.MethodGet:
-		if _, ok := authInfoFromContext(req.Context()); !ok {
-			r.logger.Error("auth context missing for env var list", "path", req.URL.Path)
-			writeError(w, http.StatusInternalServerError, "authorization context missing")
-			return
+		position := 0
+		if payload.Position != nil {
+			position = *payload.Position
 		}
-		vars, err := r.project.ListEnvVars(req.Context(), projectID)
+		input := environment.CreateEnvironmentInput{
+			ProjectID:       projectID,
+			Name:            payload.Name,
+			Slug:            payload.Slug,
+			EnvironmentType: payload.Type,
+			Protected:       protected,
+			Position:        position,
+			ActorID:         actorID,
+		}
+		env, err := r.environment.Create(req.Context(), input)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			r.respondEnvironmentError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, vars)
+		detail, detErr := r.environment.Detail(req.Context(), env.ID)
+		if detErr != nil {
+			if r.logger != nil {
+				r.logger.Warn("failed to load environment detail after create", "environment_id", env.ID, "error", detErr)
+			}
+			writeJSON(w, http.StatusCreated, environment.EnvironmentDetails{Environment: *env})
+			return
+		}
+		writeJSON(w, http.StatusCreated, detail)
 	default:
 		r.methodNotAllowed(w)
+	}
+}
+
+func (r *Router) handleEnvironmentResource(w http.ResponseWriter, req *http.Request, projectID, environmentID string) {
+	switch req.Method {
+	case http.MethodGet:
+		detail, err := r.environment.Detail(req.Context(), environmentID)
+		if err != nil {
+			r.respondEnvironmentError(w, err)
+			return
+		}
+		if detail.Environment.ProjectID != projectID {
+			r.notFound(w)
+			return
+		}
+		writeJSON(w, http.StatusOK, detail)
+	case http.MethodPatch:
+		var payload struct {
+			Name      *string `json:"name"`
+			Slug      *string `json:"slug"`
+			Type      *string `json:"type"`
+			Protected *bool   `json:"protected"`
+			Position  *int    `json:"position"`
+		}
+		decoder := json.NewDecoder(req.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		input := environment.UpdateEnvironmentInput{EnvironmentID: environmentID}
+		if payload.Name != nil {
+			name := strings.TrimSpace(*payload.Name)
+			input.Name = &name
+		}
+		if payload.Slug != nil {
+			slug := strings.TrimSpace(*payload.Slug)
+			input.Slug = &slug
+		}
+		if payload.Type != nil {
+			typeVal := strings.TrimSpace(*payload.Type)
+			input.EnvironmentType = &typeVal
+		}
+		if payload.Protected != nil {
+			protected := *payload.Protected
+			input.Protected = &protected
+		}
+		if payload.Position != nil {
+			position := *payload.Position
+			input.Position = &position
+		}
+		updated, err := r.environment.Update(req.Context(), input)
+		if err != nil {
+			r.respondEnvironmentError(w, err)
+			return
+		}
+		if updated.ProjectID != projectID {
+			r.notFound(w)
+			return
+		}
+		detail, err := r.environment.Detail(req.Context(), updated.ID)
+		if err != nil {
+			r.respondEnvironmentError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, detail)
+	default:
+		r.methodNotAllowed(w)
+	}
+}
+
+func (r *Router) handleEnvironmentVersions(w http.ResponseWriter, req *http.Request, projectID, environmentID string, segments []string) {
+	if len(segments) == 0 || segments[0] == "" {
+		r.handleEnvironmentVersionCollection(w, req, projectID, environmentID)
+		return
+	}
+	versionID := strings.TrimSpace(segments[0])
+	if versionID == "" {
+		r.notFound(w)
+		return
+	}
+	if len(segments) == 1 || segments[1] == "" {
+		r.handleEnvironmentVersionResource(w, req, projectID, environmentID, versionID)
+		return
+	}
+	r.notFound(w)
+}
+
+func (r *Router) handleEnvironmentVersionCollection(w http.ResponseWriter, req *http.Request, projectID, environmentID string) {
+	switch req.Method {
+	case http.MethodGet:
+		limit, _ := strconv.Atoi(req.URL.Query().Get("limit"))
+		env, err := r.environment.GetEnvironment(req.Context(), environmentID)
+		if err != nil {
+			r.respondEnvironmentError(w, err)
+			return
+		}
+		if env.ProjectID != projectID {
+			r.notFound(w)
+			return
+		}
+		versions, err := r.environment.ListVersions(req.Context(), environmentID, limit)
+		if err != nil {
+			r.respondEnvironmentError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, versions)
+	case http.MethodPost:
+		var payload struct {
+			Description string `json:"description"`
+			Variables   []struct {
+				Key   string `json:"key"`
+				Value string `json:"value"`
+			} `json:"variables"`
+		}
+		decoder := json.NewDecoder(req.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		env, err := r.environment.GetEnvironment(req.Context(), environmentID)
+		if err != nil {
+			r.respondEnvironmentError(w, err)
+			return
+		}
+		if env.ProjectID != projectID {
+			r.notFound(w)
+			return
+		}
+		info, _ := authInfoFromContext(req.Context())
+		var actorID *string
+		if strings.TrimSpace(info.UserID) != "" {
+			user := strings.TrimSpace(info.UserID)
+			actorID = &user
+		}
+		variables := make([]environment.VariableInput, 0, len(payload.Variables))
+		for _, item := range payload.Variables {
+			variables = append(variables, environment.VariableInput{Key: item.Key, Value: item.Value})
+		}
+		input := environment.CreateVersionInput{
+			EnvironmentID: environmentID,
+			Description:   payload.Description,
+			Variables:     variables,
+			ActorID:       actorID,
+		}
+		version, err := r.environment.CreateVersion(req.Context(), input)
+		if err != nil {
+			r.respondEnvironmentError(w, err)
+			return
+		}
+		if version.Version.EnvironmentID != environmentID {
+			r.notFound(w)
+			return
+		}
+		writeJSON(w, http.StatusCreated, version)
+	default:
+		r.methodNotAllowed(w)
+	}
+}
+
+func (r *Router) handleEnvironmentVersionResource(w http.ResponseWriter, req *http.Request, projectID, environmentID, versionID string) {
+	if req.Method != http.MethodGet {
+		r.methodNotAllowed(w)
+		return
+	}
+	version, err := r.environment.GetVersion(req.Context(), versionID)
+	if err != nil {
+		r.respondEnvironmentError(w, err)
+		return
+	}
+	if version.Version.EnvironmentID != environmentID {
+		r.notFound(w)
+		return
+	}
+	env, err := r.environment.GetEnvironment(req.Context(), environmentID)
+	if err != nil {
+		r.respondEnvironmentError(w, err)
+		return
+	}
+	if env.ProjectID != projectID {
+		r.notFound(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, version)
+}
+
+func (r *Router) handleEnvironmentAudits(w http.ResponseWriter, req *http.Request, projectID string) {
+	if req.Method != http.MethodGet {
+		r.methodNotAllowed(w)
+		return
+	}
+	environmentID := strings.TrimSpace(req.URL.Query().Get("environment_id"))
+	limit, _ := strconv.Atoi(req.URL.Query().Get("limit"))
+	if environmentID != "" {
+		env, err := r.environment.GetEnvironment(req.Context(), environmentID)
+		if err != nil {
+			r.respondEnvironmentError(w, err)
+			return
+		}
+		if env.ProjectID != projectID {
+			r.notFound(w)
+			return
+		}
+	}
+	audits, err := r.environment.ListAudits(req.Context(), projectID, environmentID, limit)
+	if err != nil {
+		r.respondEnvironmentError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, audits)
+}
+
+func (r *Router) respondEnvironmentError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, repository.ErrInvalidArgument):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, repository.ErrNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, err.Error())
 	}
 }
 

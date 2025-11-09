@@ -41,9 +41,52 @@ export interface Project {
   created_at: string;
 }
 
-export interface ProjectEnvVar {
+export interface Environment {
+  id: string;
+  project_id: string;
+  slug: string;
+  name: string;
+  environment_type: string;
+  protected: boolean;
+  position: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EnvironmentVariable {
   key: string;
   value: string;
+  checksum?: string | null;
+}
+
+export interface EnvironmentVersion {
+  id: string;
+  environment_id: string;
+  version: number;
+  description: string;
+  created_by: string | null;
+  created_at: string;
+}
+
+export interface EnvironmentVersionDetails {
+  version: EnvironmentVersion;
+  variables: EnvironmentVariable[];
+}
+
+export interface EnvironmentDetails {
+  environment: Environment;
+  latest_version?: EnvironmentVersionDetails;
+}
+
+export interface EnvironmentAudit {
+  id: number;
+  project_id: string;
+  environment_id: string | null;
+  version_id: string | null;
+  actor_id: string | null;
+  action: string;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
 }
 
 export interface Deployment {
@@ -118,4 +161,30 @@ export interface CreateProjectInput {
   Type: string;
   BuildCommand: string;
   RunCommand: string;
+}
+
+export interface CreateEnvironmentInput {
+  name: string;
+  slug?: string;
+  type?: string;
+  protected?: boolean;
+  position?: number;
+}
+
+export interface UpdateEnvironmentInput {
+  name?: string;
+  slug?: string;
+  type?: string;
+  protected?: boolean;
+  position?: number;
+}
+
+export interface EnvironmentVariableInput {
+  key: string;
+  value: string;
+}
+
+export interface CreateEnvironmentVersionInput {
+  description?: string;
+  variables: EnvironmentVariableInput[];
 }

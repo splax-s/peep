@@ -31,6 +31,7 @@ var (
 	_ repository.UserRepository         = (*Repository)(nil)
 	_ repository.TeamRepository         = (*Repository)(nil)
 	_ repository.ProjectRepository      = (*Repository)(nil)
+	_ repository.EnvironmentRepository  = (*Repository)(nil)
 	_ repository.DeploymentRepository   = (*Repository)(nil)
 	_ repository.LogRepository          = (*Repository)(nil)
 	_ repository.WebhookRepository      = (*Repository)(nil)
@@ -209,6 +210,458 @@ func (r *Repository) ListProjectEnvVars(ctx context.Context, projectID string) (
 			return nil, err
 		}
 		vars = append(vars, env)
+	}
+	return vars, rows.Err()
+}
+
+// ListEnvironmentsByProject returns environments ordered by position for the project.
+func (r *Repository) ListEnvironmentsByProject(ctx context.Context, projectID string) ([]domain.Environment, error) {
+	const query = `SELECT id, project_id, slug, name, environment_type, protected, position, created_at, updated_at
+		FROM environments WHERE project_id = $1 ORDER BY position ASC, created_at ASC`
+	rows, err := r.pool.Query(ctx, query, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	envs := make([]domain.Environment, 0)
+	for rows.Next() {
+		var env domain.Environment
+		if err := rows.Scan(
+			&env.ID,
+			&env.ProjectID,
+			&env.Slug,
+			&env.Name,
+			&env.EnvironmentType,
+			&env.Protected,
+			&env.Position,
+			&env.CreatedAt,
+			&env.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		envs = append(envs, env)
+	}
+	return envs, rows.Err()
+}
+
+// GetEnvironmentByID loads a single environment.
+func (r *Repository) GetEnvironmentByID(ctx context.Context, environmentID string) (*domain.Environment, error) {
+	const query = `SELECT id, project_id, slug, name, environment_type, protected, position, created_at, updated_at
+		FROM environments WHERE id = $1`
+	row := r.pool.QueryRow(ctx, query, environmentID)
+	var env domain.Environment
+	if err := row.Scan(
+		&env.ID,
+		&env.ProjectID,
+		&env.Slug,
+		&env.Name,
+		&env.EnvironmentType,
+		&env.Protected,
+		&env.Position,
+		&env.CreatedAt,
+		&env.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, repository.ErrNotFound
+		}
+		return nil, err
+	}
+	return &env, nil
+}
+
+// CreateEnvironment inserts a new environment record.
+func (r *Repository) CreateEnvironment(ctx context.Context, environment *domain.Environment) error {
+	if environment == nil {
+		return fmt.Errorf("environment required")
+	}
+	const query = `INSERT INTO environments (id, project_id, slug, name, environment_type, protected, position, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 0), NOW(), NOW())
+		RETURNING created_at, updated_at`
+	var createdAt, updatedAt time.Time
+	err := r.pool.QueryRow(ctx, query,
+		environment.ID,
+		environment.ProjectID,
+		environment.Slug,
+		environment.Name,
+		environment.EnvironmentType,
+		environment.Protected,
+		intToNil(environment.Position),
+	).Scan(&createdAt, &updatedAt)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23503":
+				return repository.ErrNotFound
+			case "23514", "22P02", "23505":
+				return repository.ErrInvalidArgument
+			}
+		}
+		return err
+	}
+	environment.CreatedAt = createdAt
+	environment.UpdatedAt = updatedAt
+	return nil
+}
+
+// UpdateEnvironment mutates environment metadata.
+func (r *Repository) UpdateEnvironment(ctx context.Context, environment *domain.Environment) error {
+	if environment == nil {
+		return fmt.Errorf("environment required")
+	}
+	const query = `UPDATE environments
+		SET slug = $2,
+			name = $3,
+			environment_type = $4,
+			protected = $5,
+			position = COALESCE($6, position),
+			updated_at = NOW()
+		WHERE id = $1 RETURNING updated_at`
+	row := r.pool.QueryRow(ctx, query,
+		environment.ID,
+		environment.Slug,
+		environment.Name,
+		environment.EnvironmentType,
+		environment.Protected,
+		intToNil(environment.Position),
+	)
+	var updatedAt time.Time
+	if err := row.Scan(&updatedAt); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23505":
+				return repository.ErrInvalidArgument
+			case "23503":
+				return repository.ErrNotFound
+			case "23514", "22P02":
+				return repository.ErrInvalidArgument
+			}
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			return repository.ErrNotFound
+		}
+		return err
+	}
+	environment.UpdatedAt = updatedAt
+	return nil
+}
+
+// CreateEnvironmentVersion stores a new environment version and associated variables.
+func (r *Repository) CreateEnvironmentVersion(ctx context.Context, version *domain.EnvironmentVersion, vars []domain.EnvironmentVariable) error {
+	if version == nil {
+		return fmt.Errorf("environment version required")
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	const versionInsert = `INSERT INTO environment_versions (id, environment_id, version, description, created_by, created_at)
+		VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING created_at`
+	var createdAt time.Time
+	if err := tx.QueryRow(ctx, versionInsert,
+		version.ID,
+		version.EnvironmentID,
+		version.Version,
+		nilIfEmpty(version.Description),
+		stringPtrToNil(version.CreatedBy),
+	).Scan(&createdAt); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23503":
+				return repository.ErrNotFound
+			case "23514", "22P02", "23505":
+				return repository.ErrInvalidArgument
+			}
+		}
+		return err
+	}
+	version.CreatedAt = createdAt
+
+	if len(vars) > 0 {
+		const varInsert = `INSERT INTO environment_version_vars (version_id, key, value, checksum)
+			VALUES ($1, $2, $3, $4)`
+		batch := &pgx.Batch{}
+		for _, variable := range vars {
+			batch.Queue(varInsert,
+				version.ID,
+				variable.Key,
+				variable.Value,
+				stringPtrToNil(variable.Checksum),
+			)
+		}
+		br := tx.SendBatch(ctx, batch)
+		for range vars {
+			if _, err := br.Exec(); err != nil {
+				br.Close()
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) {
+					switch pgErr.Code {
+					case "23503":
+						return repository.ErrNotFound
+					case "23514", "22P02":
+						return repository.ErrInvalidArgument
+					case "23505":
+						return repository.ErrInvalidArgument
+					}
+				}
+				return err
+			}
+		}
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE environments SET updated_at = NOW() WHERE id = $1`, version.EnvironmentID); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ListEnvironmentVersions enumerates versions for an environment.
+func (r *Repository) ListEnvironmentVersions(ctx context.Context, environmentID string, limit int) ([]domain.EnvironmentVersion, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	const query = `SELECT id, environment_id, version, description, created_by, created_at
+		FROM environment_versions WHERE environment_id = $1 ORDER BY version DESC LIMIT $2`
+	rows, err := r.pool.Query(ctx, query, environmentID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	versions := make([]domain.EnvironmentVersion, 0)
+	for rows.Next() {
+		var (
+			version   domain.EnvironmentVersion
+			createdBy sql.NullString
+		)
+		if err := rows.Scan(
+			&version.ID,
+			&version.EnvironmentID,
+			&version.Version,
+			&version.Description,
+			&createdBy,
+			&version.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if createdBy.Valid {
+			value := createdBy.String
+			version.CreatedBy = &value
+		}
+		versions = append(versions, version)
+	}
+	return versions, rows.Err()
+}
+
+// GetEnvironmentVersion fetches a specific version and its variables.
+func (r *Repository) GetEnvironmentVersion(ctx context.Context, versionID string) (*domain.EnvironmentVersion, []domain.EnvironmentVariable, error) {
+	const query = `SELECT id, environment_id, version, description, created_by, created_at
+		FROM environment_versions WHERE id = $1`
+	row := r.pool.QueryRow(ctx, query, versionID)
+	var (
+		version   domain.EnvironmentVersion
+		createdBy sql.NullString
+	)
+	if err := row.Scan(
+		&version.ID,
+		&version.EnvironmentID,
+		&version.Version,
+		&version.Description,
+		&createdBy,
+		&version.CreatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, repository.ErrNotFound
+		}
+		return nil, nil, err
+	}
+	if createdBy.Valid {
+		value := createdBy.String
+		version.CreatedBy = &value
+	}
+	vars, err := r.listEnvironmentVariables(ctx, version.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &version, vars, nil
+}
+
+// GetLatestEnvironmentVersion loads most recent version for an environment.
+func (r *Repository) GetLatestEnvironmentVersion(ctx context.Context, environmentID string) (*domain.EnvironmentVersion, []domain.EnvironmentVariable, error) {
+	const query = `SELECT id, environment_id, version, description, created_by, created_at
+		FROM environment_versions WHERE environment_id = $1 ORDER BY version DESC LIMIT 1`
+	row := r.pool.QueryRow(ctx, query, environmentID)
+	var (
+		version   domain.EnvironmentVersion
+		createdBy sql.NullString
+	)
+	if err := row.Scan(
+		&version.ID,
+		&version.EnvironmentID,
+		&version.Version,
+		&version.Description,
+		&createdBy,
+		&version.CreatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, repository.ErrNotFound
+		}
+		return nil, nil, err
+	}
+	if createdBy.Valid {
+		value := createdBy.String
+		version.CreatedBy = &value
+	}
+	vars, err := r.listEnvironmentVariables(ctx, version.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &version, vars, nil
+}
+
+// InsertEnvironmentAudit records an audit entry.
+func (r *Repository) InsertEnvironmentAudit(ctx context.Context, audit *domain.EnvironmentAudit) error {
+	if audit == nil {
+		return fmt.Errorf("audit required")
+	}
+	const query = `INSERT INTO environment_audits (project_id, environment_id, version_id, actor_id, action, metadata, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING id, created_at`
+	var (
+		environmentID any
+		versionID     any
+		actorID       any
+	)
+	if audit.EnvironmentID != nil {
+		environmentID = nilIfEmpty(*audit.EnvironmentID)
+	}
+	if audit.VersionID != nil {
+		versionID = nilIfEmpty(*audit.VersionID)
+	}
+	if audit.ActorID != nil {
+		actorID = nilIfEmpty(*audit.ActorID)
+	}
+	var createdAt time.Time
+	if err := r.pool.QueryRow(ctx, query,
+		audit.ProjectID,
+		environmentID,
+		versionID,
+		actorID,
+		audit.Action,
+		bytesToNil(audit.Metadata),
+	).Scan(&audit.ID, &createdAt); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23503":
+				return repository.ErrNotFound
+			case "23514", "22P02":
+				return repository.ErrInvalidArgument
+			}
+		}
+		return err
+	}
+	audit.CreatedAt = createdAt
+	return nil
+}
+
+// ListEnvironmentAudits enumerates recent audit entries for a project.
+func (r *Repository) ListEnvironmentAudits(ctx context.Context, projectID, environmentID string, limit int) ([]domain.EnvironmentAudit, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	const query = `SELECT id, project_id, environment_id, version_id, actor_id, action, metadata, created_at
+		FROM environment_audits
+		WHERE project_id = $1 AND ($2 = '' OR environment_id::text = $2)
+		ORDER BY created_at DESC
+		LIMIT $3`
+	rows, err := r.pool.Query(ctx, query, projectID, strings.TrimSpace(environmentID), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	audits := make([]domain.EnvironmentAudit, 0)
+	for rows.Next() {
+		var (
+			audit     domain.EnvironmentAudit
+			envID     sql.NullString
+			versionID sql.NullString
+			actorID   sql.NullString
+			metadata  []byte
+		)
+		if err := rows.Scan(
+			&audit.ID,
+			&audit.ProjectID,
+			&envID,
+			&versionID,
+			&actorID,
+			&audit.Action,
+			&metadata,
+			&audit.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if envID.Valid {
+			value := envID.String
+			audit.EnvironmentID = &value
+		}
+		if versionID.Valid {
+			value := versionID.String
+			audit.VersionID = &value
+		}
+		if actorID.Valid {
+			value := actorID.String
+			audit.ActorID = &value
+		}
+		if len(metadata) > 0 {
+			audit.Metadata = append([]byte(nil), metadata...)
+		}
+		audits = append(audits, audit)
+	}
+	return audits, rows.Err()
+}
+
+func (r *Repository) listEnvironmentVariables(ctx context.Context, versionID string) ([]domain.EnvironmentVariable, error) {
+	const query = `SELECT version_id, key, value, checksum, created_at
+		FROM environment_version_vars WHERE version_id = $1 ORDER BY key`
+	rows, err := r.pool.Query(ctx, query, versionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	vars := make([]domain.EnvironmentVariable, 0)
+	for rows.Next() {
+		var (
+			variable domain.EnvironmentVariable
+			checksum sql.NullString
+		)
+		if err := rows.Scan(
+			&variable.VersionID,
+			&variable.Key,
+			&variable.Value,
+			&checksum,
+			&variable.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if checksum.Valid {
+			value := checksum.String
+			variable.Checksum = &value
+		}
+		vars = append(vars, variable)
 	}
 	return vars, rows.Err()
 }
@@ -461,6 +914,23 @@ func nilTime(t time.Time) any {
 		return nil
 	}
 	return t
+}
+
+func stringPtrToNil(v *string) any {
+	if v == nil {
+		return nil
+	}
+	if strings.TrimSpace(*v) == "" {
+		return nil
+	}
+	return *v
+}
+
+func bytesToNil(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 // ListRuntimeEvents returns recent runtime telemetry events for a project.

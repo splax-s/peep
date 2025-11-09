@@ -13,7 +13,8 @@ import {
 import { AnimatePresence, motion } from 'framer-motion';
 import { useRouter, useSearchParams } from 'next/navigation';
 import {
-  addEnvVarAction,
+  createEnvironmentAction,
+  createEnvironmentVersionAction,
   createProjectAction,
   createTeamAction,
   deleteDeploymentAction,
@@ -28,8 +29,10 @@ import {
 } from '@/lib/dashboard';
 import type {
   Deployment,
+  EnvironmentAudit,
+  EnvironmentDetails,
+  EnvironmentVersion,
   Project,
-  ProjectEnvVar,
   ProjectLog,
   RuntimeEvent,
   RuntimeMetricRollup,
@@ -43,7 +46,10 @@ interface DashboardClientProps {
   projects: Project[];
   activeProjectId: string | null;
   project: Project | null;
-  envVars: ProjectEnvVar[];
+  environments: EnvironmentDetails[];
+  activeEnvironmentId: string | null;
+  environmentVersions: EnvironmentVersion[];
+  environmentAudits: EnvironmentAudit[];
   deployments: Deployment[];
   logs: ProjectLog[];
   logsHasMore: boolean;
@@ -60,7 +66,10 @@ interface DashboardState {
   projects: Project[];
   activeProjectId: string | null;
   project: Project | null;
-  envVars: ProjectEnvVar[];
+  environments: EnvironmentDetails[];
+  activeEnvironmentId: string | null;
+  environmentVersions: EnvironmentVersion[];
+  environmentAudits: EnvironmentAudit[];
   deployments: Deployment[];
   logs: ProjectLog[];
   logsHasMore: boolean;
@@ -121,13 +130,16 @@ class UnauthorizedError extends Error {
   }
 }
 
-async function fetchDashboardState(teamId: string | null, projectId: string | null): Promise<DashboardState> {
+async function fetchDashboardState(teamId: string | null, projectId: string | null, environmentId?: string | null): Promise<DashboardState> {
   const params = new URLSearchParams();
   if (teamId) {
     params.set('team', teamId);
   }
   if (projectId) {
     params.set('project', projectId);
+  }
+  if (environmentId) {
+    params.set('environment', environmentId);
   }
   const response = await fetch(`/api/dashboard/state${params.size ? `?${params.toString()}` : ''}`, {
     method: 'GET',
@@ -314,11 +326,13 @@ export function DashboardClient(props: DashboardClientProps) {
   const [logoutPending, startLogout] = useTransition();
   const [teamPending, startTeamAction] = useTransition();
   const [projectPending, startProjectAction] = useTransition();
-  const [envPending, startEnvAction] = useTransition();
+  const [environmentPending, startEnvironmentAction] = useTransition();
+  const [versionPending, startVersionAction] = useTransition();
   const [deployPending, startDeployAction] = useTransition();
   const [deletePending, startDeleteAction] = useTransition();
   const runtimeBucketOptions = [60, 300, 900];
   const runtimeLevelOptions = ['debug', 'info', 'warn', 'error'] as const;
+  const environmentTypeOptions = ['production', 'staging', 'development', 'preview', 'custom'] as const;
 
   const [state, setState] = useState<DashboardState>(() => ({
     userEmail: props.userEmail,
@@ -327,7 +341,10 @@ export function DashboardClient(props: DashboardClientProps) {
     projects: props.projects,
     activeProjectId: props.activeProjectId,
     project: props.project,
-    envVars: props.envVars,
+    environments: props.environments,
+    activeEnvironmentId: props.activeEnvironmentId,
+    environmentVersions: props.environmentVersions,
+    environmentAudits: props.environmentAudits,
     deployments: props.deployments,
     logs: props.logs,
     logsHasMore: props.logsHasMore,
@@ -351,9 +368,16 @@ export function DashboardClient(props: DashboardClientProps) {
   const [projectBuildCommand, setProjectBuildCommand] = useState(DEFAULT_BUILD_COMMAND);
   const [projectRunCommand, setProjectRunCommand] = useState(DEFAULT_RUN_COMMAND);
   const [projectFormError, setProjectFormError] = useState<string | null>(null);
-  const [envKey, setEnvKey] = useState('');
-  const [envValue, setEnvValue] = useState('');
-  const [envError, setEnvError] = useState<string | null>(null);
+  const [environmentFormOpen, setEnvironmentFormOpen] = useState(false);
+  const [environmentName, setEnvironmentName] = useState('');
+  const [environmentSlug, setEnvironmentSlug] = useState('');
+  const [environmentType, setEnvironmentType] = useState<'production' | 'staging' | 'development' | 'preview' | 'custom'>('development');
+  const [environmentProtected, setEnvironmentProtected] = useState(false);
+  const [environmentPosition, setEnvironmentPosition] = useState('');
+  const [environmentFormError, setEnvironmentFormError] = useState<string | null>(null);
+  const [versionEditor, setVersionEditor] = useState('');
+  const [versionDescription, setVersionDescription] = useState('');
+  const [versionError, setVersionError] = useState<string | null>(null);
   const [deployCommit, setDeployCommit] = useState('');
   const [deployError, setDeployError] = useState<string | null>(null);
   const [deletingDeploymentId, setDeletingDeploymentId] = useState<string | null>(null);
@@ -481,7 +505,10 @@ export function DashboardClient(props: DashboardClientProps) {
       projects: props.projects,
       activeProjectId: props.activeProjectId,
       project: props.project,
-      envVars: props.envVars,
+      environments: props.environments,
+      activeEnvironmentId: props.activeEnvironmentId,
+      environmentVersions: props.environmentVersions,
+      environmentAudits: props.environmentAudits,
       deployments: props.deployments,
       logs: props.logs,
       logsHasMore: props.logsHasMore,
@@ -497,7 +524,10 @@ export function DashboardClient(props: DashboardClientProps) {
     props.projects,
     props.activeProjectId,
     props.project,
-    props.envVars,
+    props.environments,
+    props.activeEnvironmentId,
+    props.environmentVersions,
+    props.environmentAudits,
     props.deployments,
     props.logs,
     props.logsHasMore,
@@ -858,6 +888,48 @@ export function DashboardClient(props: DashboardClientProps) {
     return state.teams.find((team) => team.id === state.activeTeamId) ?? null;
   }, [state.activeTeamId, state.teams]);
 
+  const environmentsSorted = useMemo(() => {
+    return [...state.environments].sort((a, b) => a.environment.position - b.environment.position);
+  }, [state.environments]);
+
+  const activeEnvironment = useMemo(() => {
+    if (!environmentsSorted.length) {
+      return null;
+    }
+    if (state.activeEnvironmentId) {
+      return (
+        environmentsSorted.find((candidate) => candidate.environment.id === state.activeEnvironmentId) ??
+        environmentsSorted[0]
+      );
+    }
+    return environmentsSorted[0];
+  }, [environmentsSorted, state.activeEnvironmentId]);
+
+  const latestEnvironmentVersion = useMemo(() => {
+    return activeEnvironment?.latest_version ?? null;
+  }, [activeEnvironment]);
+
+  const latestEnvironmentVariables = useMemo(() => {
+    return latestEnvironmentVersion?.variables ?? [];
+  }, [latestEnvironmentVersion]);
+
+  useEffect(() => {
+    if (!activeEnvironment || !latestEnvironmentVersion) {
+      setVersionEditor('');
+      return;
+    }
+    if (!latestEnvironmentVariables.length) {
+      setVersionEditor('');
+      return;
+    }
+    const serialized = latestEnvironmentVariables.map((variable) => `${variable.key}=${variable.value}`).join('\n');
+    setVersionEditor(serialized);
+  }, [activeEnvironment, latestEnvironmentVersion, latestEnvironmentVariables]);
+
+  const environmentVersionsSorted = useMemo(() => {
+    return [...state.environmentVersions].sort((a, b) => b.version - a.version);
+  }, [state.environmentVersions]);
+
   const runtimeEventTypes = useMemo(() => {
     const values = new Set<string>();
     state.runtimeEvents.forEach((event) => {
@@ -1006,10 +1078,15 @@ export function DashboardClient(props: DashboardClientProps) {
     void loadRuntimeMetrics(state.activeProjectId, runtimeBucketSpan, runtimeEventTypeFilter);
   }, [state.activeProjectId, runtimeBucketSpan, runtimeEventTypeFilter, loadRuntimeMetrics]);
 
-  async function reloadState(nextTeamId: string | null, nextProjectId: string | null, successMessage?: string) {
+  async function reloadState(
+    nextTeamId: string | null,
+    nextProjectId: string | null,
+    successMessage?: string,
+    nextEnvironmentId?: string | null,
+  ) {
     setDataPending(true);
     try {
-      const nextState = await fetchDashboardState(nextTeamId, nextProjectId);
+      const nextState = await fetchDashboardState(nextTeamId, nextProjectId, nextEnvironmentId);
       setState(nextState);
       setRuntimeMetricsError(null);
       setRuntimeEventsError(null);
@@ -1051,7 +1128,10 @@ export function DashboardClient(props: DashboardClientProps) {
       activeTeamId: teamId,
       activeProjectId: null,
       project: null,
-      envVars: [],
+      environments: [],
+      activeEnvironmentId: null,
+      environmentVersions: [],
+      environmentAudits: [],
       deployments: [],
       logs: [],
       logsHasMore: false,
@@ -1073,9 +1153,9 @@ export function DashboardClient(props: DashboardClientProps) {
       runtimeMetricsRefreshTimerRef.current = null;
     }
     startNavigation(() => {
-      updateSearchParams({ team: teamId, project: null });
+      updateSearchParams({ team: teamId, project: null, environment: null });
     });
-    void reloadState(teamId, null);
+    void reloadState(teamId, null, undefined, null);
   }
 
   function handleSelectProject(projectId: string) {
@@ -1083,13 +1163,16 @@ export function DashboardClient(props: DashboardClientProps) {
       return;
     }
     startNavigation(() => {
-      updateSearchParams({ team: state.activeTeamId ?? null, project: projectId });
+      updateSearchParams({ team: state.activeTeamId ?? null, project: projectId, environment: null });
     });
     setState((prev) => ({
       ...prev,
       activeProjectId: projectId,
       project: prev.projects.find((project) => project.id === projectId) ?? prev.project,
-      envVars: [],
+      environments: [],
+      activeEnvironmentId: null,
+      environmentVersions: [],
+      environmentAudits: [],
       deployments: [],
       logs: [],
       logsHasMore: false,
@@ -1110,12 +1193,12 @@ export function DashboardClient(props: DashboardClientProps) {
       window.clearTimeout(runtimeMetricsRefreshTimerRef.current);
       runtimeMetricsRefreshTimerRef.current = null;
     }
-    void reloadState(state.activeTeamId, projectId);
+    void reloadState(state.activeTeamId, projectId, undefined, null);
   }
 
   function handleRefresh() {
     startRefreshTransition(() => {
-      void reloadState(state.activeTeamId, state.activeProjectId, 'Dashboard data refreshed.');
+      void reloadState(state.activeTeamId, state.activeProjectId, 'Dashboard data refreshed.', state.activeEnvironmentId);
     });
   }
 
@@ -1197,43 +1280,146 @@ export function DashboardClient(props: DashboardClientProps) {
       }
       setProjectName('');
       setProjectRepo('');
-  setProjectBuildCommand(DEFAULT_BUILD_COMMAND);
-  setProjectRunCommand(DEFAULT_RUN_COMMAND);
+      setProjectBuildCommand(DEFAULT_BUILD_COMMAND);
+      setProjectRunCommand(DEFAULT_RUN_COMMAND);
       setProjectFormOpen(false);
       await reloadState(state.activeTeamId, null, 'Project provisioned.');
     });
   }
 
-  function handleAddEnvVar(event: FormEvent<HTMLFormElement>) {
+  function handleCreateEnvironment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!state.activeProjectId) {
-      setEnvError('Select a project first.');
+      setEnvironmentFormError('Select a project first.');
       return;
     }
-    const keyTrimmed = envKey.trim().toUpperCase();
-    const valueTrimmed = envValue.trim();
-    if (!keyTrimmed) {
-      setEnvError('Key is required.');
+
+    const nameTrimmed = environmentName.trim();
+    if (!nameTrimmed) {
+      setEnvironmentFormError('Environment name is required.');
       return;
     }
-    if (!valueTrimmed) {
-      setEnvError('Value is required.');
-      return;
-    }
-    setEnvError(null);
-    startEnvAction(async () => {
-      const result = await addEnvVarAction({
-        projectId: state.activeProjectId!,
-        key: keyTrimmed,
-        value: valueTrimmed,
-      });
-      if (!result.success) {
-        setEnvError(result.error ?? 'Failed to save variable.');
+
+    const slugTrimmed = environmentSlug.trim();
+    const positionTrimmed = environmentPosition.trim();
+    let positionValue: number | undefined;
+    if (positionTrimmed) {
+      const parsed = Number(positionTrimmed);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        setEnvironmentFormError('Position must be a positive number.');
         return;
       }
-      setEnvKey('');
-      setEnvValue('');
-      await reloadState(state.activeTeamId, state.activeProjectId, 'Environment variable saved.');
+      positionValue = Math.floor(parsed);
+    }
+
+    setEnvironmentFormError(null);
+    startEnvironmentAction(async () => {
+      const result = await createEnvironmentAction({
+        projectId: state.activeProjectId!,
+        name: nameTrimmed,
+        slug: slugTrimmed || undefined,
+        type: environmentType,
+        protected: environmentProtected,
+        position: positionValue,
+      });
+      if (!result.success) {
+        setEnvironmentFormError(result.error ?? 'Failed to create environment.');
+        return;
+      }
+      setEnvironmentName('');
+      setEnvironmentSlug('');
+      setEnvironmentType('development');
+      setEnvironmentProtected(false);
+      setEnvironmentPosition('');
+      setEnvironmentFormOpen(false);
+      await reloadState(
+        state.activeTeamId,
+        state.activeProjectId,
+        'Environment created.',
+        result.environmentId ?? null,
+      );
+    });
+  }
+
+  function handleSelectEnvironment(environmentId: string) {
+    if (!environmentId || environmentId === state.activeEnvironmentId) {
+      return;
+    }
+    setState((prev) => ({
+      ...prev,
+      activeEnvironmentId: environmentId,
+      environmentVersions: [],
+      environmentAudits: [],
+    }));
+    setVersionError(null);
+    setVersionDescription('');
+    startNavigation(() => {
+      updateSearchParams({
+        team: state.activeTeamId ?? null,
+        project: state.activeProjectId ?? null,
+        environment: environmentId,
+      });
+    });
+    void reloadState(state.activeTeamId, state.activeProjectId, undefined, environmentId);
+  }
+
+  function handlePublishEnvironmentVersion(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!state.activeProjectId || !state.activeEnvironmentId) {
+      setVersionError('Select an environment to publish a version.');
+      return;
+    }
+
+    const summary = versionDescription.trim();
+    const lines = versionEditor.split('\n');
+    const variables: { key: string; value: string }[] = [];
+    const seen = new Set<string>();
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) {
+        continue;
+      }
+      const [keyPart, ...rest] = line.split('=');
+      const key = keyPart.trim().toUpperCase();
+      const value = rest.join('=').trim();
+      if (!key) {
+        setVersionError('Variable keys are required.');
+        return;
+      }
+      if (seen.has(key)) {
+        setVersionError(`Duplicate variable detected: ${key}`);
+        return;
+      }
+      seen.add(key);
+      variables.push({ key, value });
+    }
+
+    if (variables.length === 0) {
+      setVersionError('Provide at least one variable.');
+      return;
+    }
+
+    setVersionError(null);
+    startVersionAction(async () => {
+      const result = await createEnvironmentVersionAction({
+        projectId: state.activeProjectId!,
+        environmentId: state.activeEnvironmentId!,
+        description: summary || undefined,
+        variables,
+      });
+      if (!result.success) {
+        setVersionError(result.error ?? 'Failed to publish version.');
+        return;
+      }
+      setVersionDescription('');
+      setVersionEditor('');
+      await reloadState(
+        state.activeTeamId,
+        state.activeProjectId,
+        'Environment version published.',
+        state.activeEnvironmentId,
+      );
     });
   }
 
@@ -1378,7 +1564,8 @@ export function DashboardClient(props: DashboardClientProps) {
     logoutPending ||
     teamPending ||
     projectPending ||
-    envPending ||
+  environmentPending ||
+  versionPending ||
     deployPending ||
     dataPending;
 
@@ -1712,64 +1899,296 @@ export function DashboardClient(props: DashboardClientProps) {
                   </div>
                 </dl>
               </div>
-              <section className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-white">Environment variables</h3>
-                  <span className="badge">{state.envVars.length} vars</span>
-                </div>
-                {state.envVars.length > 0 ? (
-                  <ul className="space-y-2 text-sm text-slate-200">
-                    {state.envVars.map((envVar, index) => (
-                      <li
-                        key={`${envVar.key}-${index}`}
-                        className="flex items-center justify-between rounded-xl border border-white/10 bg-slate-900/70 px-3 py-2"
-                      >
-                        <span className="font-semibold">{envVar.key}</span>
-                        <span className="font-mono text-xs text-slate-400">{envVar.value}</span>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="muted">No variables stored yet.</p>
-                )}
-                <form className="space-y-3" onSubmit={handleAddEnvVar}>
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <label className="block text-sm text-slate-200">
-                      Key
-                      <input
-                        className="mt-1 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-                        value={envKey}
-                        onChange={(event: ChangeEvent<HTMLInputElement>) => setEnvKey(event.target.value.toUpperCase())}
-                        placeholder="API_KEY"
-                        required
-                        disabled={disableInputs}
-                      />
-                    </label>
-                    <label className="block text-sm text-slate-200">
-                      Value
-                      <input
-                        className="mt-1 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-                        value={envValue}
-                        onChange={(event: ChangeEvent<HTMLInputElement>) => setEnvValue(event.target.value)}
-                        placeholder="super-secret"
-                        required
-                        disabled={disableInputs}
-                      />
-                    </label>
+              <section className="space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-white">Environments</h3>
+                    <p className="text-xs text-slate-400">Versioned secrets are promoted safely across environments.</p>
                   </div>
-                  {envError ? (
-                    <p className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
-                      {envError}
-                    </p>
-                  ) : null}
                   <button
-                    type="submit"
-                    disabled={envPending || disableInputs}
-                    className="flex w-full items-center justify-center gap-2 rounded-xl bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-300 focus:outline-none focus:ring-4 focus:ring-emerald-400/40 disabled:cursor-not-allowed disabled:opacity-60"
+                    type="button"
+                    onClick={() => setEnvironmentFormOpen((open) => !open)}
+                    disabled={disableInputs || !state.activeProjectId}
+                    className="rounded-2xl border border-emerald-500/50 px-3 py-2 text-xs font-semibold text-emerald-200 transition hover:border-emerald-400 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
                   >
-                    {envPending ? 'Saving…' : 'Save variable'}
+                    {environmentFormOpen ? 'Close environment creator' : 'Create environment'}
                   </button>
-                </form>
+                </div>
+                {environmentsSorted.length > 0 ? (
+                  <div className="space-y-4">
+                    <div className="flex flex-wrap gap-2">
+                      {environmentsSorted.map((entry) => {
+                        const env = entry.environment;
+                        const selected = activeEnvironment?.environment.id === env.id;
+                        return (
+                          <button
+                            key={env.id}
+                            type="button"
+                            onClick={() => handleSelectEnvironment(env.id)}
+                            disabled={disableInputs}
+                            className={`rounded-2xl border px-4 py-2 text-left text-sm transition ${
+                              selected
+                                ? 'border-emerald-400/80 bg-emerald-400/15 text-white'
+                                : 'border-white/10 bg-slate-900/40 text-slate-200 hover:border-emerald-300/40 hover:bg-emerald-400/10'
+                            }`}
+                          >
+                            <div className="flex flex-wrap items-center gap-2 font-semibold">
+                              <span>{env.name}</span>
+                              <span className="badge capitalize">{env.environment_type}</span>
+                              {env.protected ? (
+                                <span className="badge border-amber-400/60 bg-amber-500/15 text-amber-200">Protected</span>
+                              ) : null}
+                            </div>
+                            <p className="mt-1 text-xs text-slate-400">Slug: {env.slug}</p>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {activeEnvironment ? (
+                      <div className="space-y-4 rounded-2xl border border-white/10 bg-slate-900/70 p-4">
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                          <div>
+                            <h4 className="text-base font-semibold text-white">{activeEnvironment.environment.name}</h4>
+                            <p className="text-xs text-slate-400">ID {formatId(activeEnvironment.environment.id, 8)}</p>
+                          </div>
+                          <dl className="grid gap-3 text-xs text-slate-300 sm:grid-cols-2">
+                            <div>
+                              <dt className="uppercase tracking-wide text-slate-500">Position</dt>
+                              <dd>{activeEnvironment.environment.position}</dd>
+                            </div>
+                            <div>
+                              <dt className="uppercase tracking-wide text-slate-500">Created</dt>
+                              <dd>{formatTimestamp(activeEnvironment.environment.created_at)}</dd>
+                            </div>
+                            <div>
+                              <dt className="uppercase tracking-wide text-slate-500">Updated</dt>
+                              <dd>{formatTimestamp(activeEnvironment.environment.updated_at)}</dd>
+                            </div>
+                            <div>
+                              <dt className="uppercase tracking-wide text-slate-500">Latest version</dt>
+                              <dd>
+                                {latestEnvironmentVersion ? `v${latestEnvironmentVersion.version.version}` : 'none'}
+                              </dd>
+                            </div>
+                          </dl>
+                        </div>
+                        {latestEnvironmentVersion?.version.description ? (
+                          <p className="text-xs text-slate-300">
+                            Summary: {latestEnvironmentVersion.version.description}
+                          </p>
+                        ) : null}
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <h4 className="text-sm font-semibold text-white">Latest variables</h4>
+                            <span className="badge">{latestEnvironmentVariables.length} vars</span>
+                          </div>
+                          {latestEnvironmentVariables.length > 0 ? (
+                            <ul className="space-y-2 text-sm text-slate-200">
+                              {latestEnvironmentVariables.map((variable) => (
+                                <li
+                                  key={variable.key}
+                                  className="flex items-center justify-between rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2"
+                                >
+                                  <span className="font-semibold">{variable.key}</span>
+                                  <span className="font-mono text-xs text-slate-400">{variable.value}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="muted">No variables stored in the latest version.</p>
+                          )}
+                        </div>
+                        <form className="space-y-3" onSubmit={handlePublishEnvironmentVersion}>
+                          <div className="grid gap-3 md:grid-cols-2">
+                            <label className="block text-sm text-slate-200">
+                              Version description
+                              <input
+                                className="mt-1 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                                value={versionDescription}
+                                onChange={(event: ChangeEvent<HTMLInputElement>) => setVersionDescription(event.target.value)}
+                                placeholder="Notes for this version (optional)"
+                                disabled={disableInputs}
+                              />
+                            </label>
+                            <label className="block text-sm text-slate-200">
+                              Actor
+                              <input
+                                className="mt-1 w-full cursor-not-allowed rounded-xl border border-white/10 bg-slate-900/50 px-3 py-2 text-sm text-slate-400"
+                                value={state.userEmail}
+                                readOnly
+                                disabled
+                              />
+                            </label>
+                          </div>
+                          <label className="block text-sm text-slate-200">
+                            Variables (KEY=VALUE per line)
+                            <textarea
+                              className="mt-1 h-32 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 font-mono text-sm text-slate-100 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                              value={versionEditor}
+                              onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setVersionEditor(event.target.value)}
+                              placeholder="API_URL=https://api.example.com"
+                              disabled={disableInputs}
+                            />
+                          </label>
+                          {versionError ? (
+                            <p className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
+                              {versionError}
+                            </p>
+                          ) : null}
+                          <button
+                            type="submit"
+                            disabled={versionPending || disableInputs}
+                            className="flex w-full items-center justify-center gap-2 rounded-xl bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-300 focus:outline-none focus:ring-4 focus:ring-emerald-400/40 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {versionPending ? 'Publishing…' : 'Publish new version'}
+                          </button>
+                        </form>
+                        <div className="grid gap-4 lg:grid-cols-2">
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <h4 className="text-sm font-semibold text-white">Version history</h4>
+                              <span className="badge">{environmentVersionsSorted.length}</span>
+                            </div>
+                            {environmentVersionsSorted.length > 0 ? (
+                              <ul className="space-y-2 text-xs text-slate-300">
+                                {environmentVersionsSorted.map((version) => (
+                                  <li key={version.id} className="rounded-xl border border-white/10 bg-slate-900/80 p-3">
+                                    <div className="flex items-center justify-between text-sm font-semibold text-white">
+                                      <span>v{version.version}</span>
+                                      <span>{formatTimestamp(version.created_at)}</span>
+                                    </div>
+                                    {version.description ? (
+                                      <p className="mt-1 text-xs text-slate-300">{version.description}</p>
+                                    ) : null}
+                                    <p className="mt-1 text-[11px] uppercase tracking-wide text-slate-500">
+                                      {version.created_by ? `Published by ${version.created_by}` : 'Published via dashboard'}
+                                    </p>
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : (
+                              <p className="muted">No historical versions yet.</p>
+                            )}
+                          </div>
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <h4 className="text-sm font-semibold text-white">Audit trail</h4>
+                              <span className="badge">{state.environmentAudits.length}</span>
+                            </div>
+                            {state.environmentAudits.length > 0 ? (
+                              <ul className="space-y-2 text-xs text-slate-300">
+                                {state.environmentAudits.map((audit) => (
+                                  <li key={audit.id} className="rounded-xl border border-white/10 bg-slate-900/80 p-3">
+                                    <div className="flex items-center justify-between text-sm font-semibold text-white">
+                                      <span>{audit.action}</span>
+                                      <span>{formatTimestamp(audit.created_at)}</span>
+                                    </div>
+                                    {audit.actor_id ? (
+                                      <p className="mt-1 text-[11px] uppercase tracking-wide text-slate-500">Actor: {audit.actor_id}</p>
+                                    ) : null}
+                                    {audit.metadata ? (
+                                      <pre className="mt-2 max-h-32 overflow-x-auto overflow-y-auto rounded-lg bg-black/30 p-2 text-[11px] text-slate-200">
+                                        {JSON.stringify(audit.metadata, null, 2)}
+                                      </pre>
+                                    ) : null}
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : (
+                              <p className="muted">No audit entries yet.</p>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="muted">Select an environment to inspect details.</p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="muted">No environments defined yet. Create one to start managing secrets.</p>
+                )}
+                {environmentFormOpen ? (
+                  <form
+                    className="space-y-3 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4"
+                    onSubmit={handleCreateEnvironment}
+                  >
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <label className="block text-sm text-slate-200">
+                        Name
+                        <input
+                          className="mt-1 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                          value={environmentName}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) => setEnvironmentName(event.target.value)}
+                          placeholder="Production"
+                          required
+                          disabled={disableInputs}
+                        />
+                      </label>
+                      <label className="block text-sm text-slate-200">
+                        Slug
+                        <input
+                          className="mt-1 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                          value={environmentSlug}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) => setEnvironmentSlug(event.target.value)}
+                          placeholder="production"
+                          disabled={disableInputs}
+                        />
+                      </label>
+                    </div>
+                    <div className="grid gap-3 md:grid-cols-3">
+                      <label className="block text-sm text-slate-200">
+                        Type
+                        <select
+                          className="mt-1 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                          value={environmentType}
+                          onChange={(event: ChangeEvent<HTMLSelectElement>) =>
+                            setEnvironmentType(event.target.value as (typeof environmentTypeOptions)[number])
+                          }
+                          disabled={disableInputs}
+                        >
+                          {environmentTypeOptions.map((option) => (
+                            <option key={option} value={option}>
+                              {option}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="block text-sm text-slate-200">
+                        Position
+                        <input
+                          className="mt-1 w-full rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                          value={environmentPosition}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) => setEnvironmentPosition(event.target.value)}
+                          placeholder="1"
+                          inputMode="numeric"
+                          disabled={disableInputs}
+                        />
+                      </label>
+                      <label className="flex items-center gap-3 text-sm text-slate-200">
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 rounded border-white/10 bg-slate-900 text-emerald-400 focus:ring-emerald-500/40"
+                          checked={environmentProtected}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) => setEnvironmentProtected(event.target.checked)}
+                          disabled={disableInputs}
+                        />
+                        Protected
+                      </label>
+                    </div>
+                    {environmentFormError ? (
+                      <p className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
+                        {environmentFormError}
+                      </p>
+                    ) : null}
+                    <button
+                      type="submit"
+                      disabled={environmentPending || disableInputs}
+                      className="flex w-full items-center justify-center gap-2 rounded-xl bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-300 focus:outline-none focus:ring-4 focus:ring-emerald-400/40 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {environmentPending ? 'Creating…' : 'Save environment'}
+                    </button>
+                  </form>
+                ) : null}
               </section>
               <section className="space-y-3">
                 <div className="flex items-center justify-between">

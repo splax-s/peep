@@ -32,6 +32,20 @@ type ProjectRepository interface {
 	ListProjectEnvVars(ctx context.Context, projectID string) ([]domain.ProjectEnvVar, error)
 }
 
+// EnvironmentRepository persists environment hierarchy and versions.
+type EnvironmentRepository interface {
+	ListEnvironmentsByProject(ctx context.Context, projectID string) ([]domain.Environment, error)
+	GetEnvironmentByID(ctx context.Context, environmentID string) (*domain.Environment, error)
+	CreateEnvironment(ctx context.Context, environment *domain.Environment) error
+	UpdateEnvironment(ctx context.Context, environment *domain.Environment) error
+	CreateEnvironmentVersion(ctx context.Context, version *domain.EnvironmentVersion, vars []domain.EnvironmentVariable) error
+	ListEnvironmentVersions(ctx context.Context, environmentID string, limit int) ([]domain.EnvironmentVersion, error)
+	GetEnvironmentVersion(ctx context.Context, versionID string) (*domain.EnvironmentVersion, []domain.EnvironmentVariable, error)
+	GetLatestEnvironmentVersion(ctx context.Context, environmentID string) (*domain.EnvironmentVersion, []domain.EnvironmentVariable, error)
+	InsertEnvironmentAudit(ctx context.Context, audit *domain.EnvironmentAudit) error
+	ListEnvironmentAudits(ctx context.Context, projectID, environmentID string, limit int) ([]domain.EnvironmentAudit, error)
+}
+
 // ContainerRepository stores running container metadata.
 type ContainerRepository interface {
 	UpsertContainer(ctx context.Context, container domain.ProjectContainer) error

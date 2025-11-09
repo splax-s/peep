@@ -17,6 +17,7 @@ import (
 	"github.com/splax/localvercel/api/internal/repository/postgres"
 	"github.com/splax/localvercel/api/internal/service/auth"
 	"github.com/splax/localvercel/api/internal/service/deploy"
+	"github.com/splax/localvercel/api/internal/service/environment"
 	"github.com/splax/localvercel/api/internal/service/ingress"
 	"github.com/splax/localvercel/api/internal/service/logs"
 	"github.com/splax/localvercel/api/internal/service/project"
@@ -63,6 +64,7 @@ func main() {
 	authSvc := auth.New(repo, log, cfg)
 	teamSvc := team.New(repo, log)
 	projectSvc := project.New(repo, repo, log, cfg)
+	environmentSvc := environment.New(repo, repo, log, cfg)
 	logSvc := logs.New(repo, logHub, log)
 	ingressSvc := ingress.New(cfg, log)
 	defer ingressSvc.Close()
@@ -89,7 +91,7 @@ func main() {
 		}
 	}
 
-	router := httpx.NewRouter(log, authSvc, teamSvc, projectSvc, deploySvc, logSvc, runtimeSvc, webhookSvc, limiter, cfg.BuilderAuthToken, pool.Ping)
+	router := httpx.NewRouter(log, authSvc, teamSvc, projectSvc, environmentSvc, deploySvc, logSvc, runtimeSvc, webhookSvc, limiter, cfg.BuilderAuthToken, pool.Ping)
 	defer router.Close()
 
 	srv := &http.Server{

@@ -1,0 +1,378 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/component: backend
+data:
+    APP_ENV: development
+    API_ADDR: ":4000"
+    BUILDER_URL: http://builder.peep.svc.cluster.local:5000
+    NGINX_CONFIG_PATH: /var/lib/peep/nginx
+    INGRESS_DOMAIN_SUFFIX: .local.peep
+    PG_LOG_CHANNEL: project_logs
+    WS_LOG_BUFFER: "100"
+    METRICS_SAMPLE_SECONDS: "10"
+    INGRESS_ACME_ROOT: /var/www/acme
+    INGRESS_HEALTH_PATH: /__peep_healthz
+    INGRESS_READINESS_TIMEOUT_SECONDS: "2"
+    RUNTIME_RECONCILE_SECONDS: "30"
+    RUNTIME_METRIC_BUCKET_SECONDS: "60"
+    RUNTIME_METRIC_FLUSH_SECONDS: "30"
+    RUNTIME_CPU_LIMIT_PERCENT: "85"
+    RUNTIME_MEMORY_LIMIT_MB: "512"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: builder-config
+  labels:
+    app.kubernetes.io/name: builder
+    app.kubernetes.io/component: backend
+data:
+    APP_ENV: development
+    BUILDER_ADDR: ":5000"
+    NGINX_CONFIG_PATH: /var/lib/peep/nginx
+    GIT_TIMEOUT_SECONDS: "120"
+    BUILD_TIMEOUT_SECONDS: "900"
+    DOCKER_REGISTRY: peep
+    DEPLOY_CALLBACK_TIMEOUT_SECONDS: "10"
+    METRICS_SAMPLE_SECONDS: "10"
+    GIT_CLONE_DEPTH: "1"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dashboard-config
+  labels:
+    app.kubernetes.io/name: dashboard
+    app.kubernetes.io/component: frontend
+data:
+  NODE_ENV: development
+  PORT: "8081"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  labels:
+    app.kubernetes.io/name: nginx
+    app.kubernetes.io/component: ingress
+  annotations:
+        peep.com/source: repo
+binaryData: {}
+data:
+  nginx.conf: |
+    user  nginx;
+    worker_processes  auto;
+
+    error_log  /var/log/nginx/error.log warn;
+    pid        /var/run/nginx.pid;
+
+    events {
+        worker_connections  1024;
+    }
+
+    http {
+        include       /etc/nginx/mime.types;
+        default_type  application/octet-stream;
+
+        sendfile        on;
+        keepalive_timeout  65;
+
+        log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                          '$status $body_bytes_sent "$http_referer" '
+                          '"$http_user_agent" "$http_x_forwarded_for"';
+
+        access_log  /var/log/nginx/access.log  main;
+
+        include /etc/nginx/conf.d/*.conf;
+        include /etc/nginx/generated/*.conf;
+    }
+  default-server.conf: |
+    server {
+        listen 80 default_server;
+        server_name _;
+        error_page 404 /__peep_404.html;
+        error_page 502 503 504 /__peep_502.html;
+
+        location / {
+            return 404;
+        }
+
+        location = /__peep_healthz {
+            default_type text/plain;
+            return 200 "ok";
+        }
+
+        location = /__peep_404.html {
+            internal;
+            alias /etc/nginx/errors/404.html;
+        }
+
+        location = /__peep_502.html {
+            internal;
+            alias /etc/nginx/errors/502.html;
+        }
+    }
+  error-404.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Page Not Found · peep</title>
+        <style>
+            :root {
+                color-scheme: light dark;
+            }
+            body {
+                margin: 0;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: radial-gradient(120% 120% at 50% 0%, #0f172a 0%, #111827 55%, #0b1120 100%);
+                color: #f8fafc;
+                font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }
+            .card {
+                width: min(90vw, 520px);
+                padding: 3.5rem 3rem;
+                border-radius: 24px;
+                background: rgba(15, 23, 42, 0.7);
+                backdrop-filter: blur(18px);
+                box-shadow: 0 22px 60px rgba(15, 23, 42, 0.45);
+                border: 1px solid rgba(148, 163, 184, 0.2);
+                text-align: center;
+            }
+            .badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.5rem;
+                padding: 0.35rem 0.9rem;
+                border-radius: 999px;
+                background: rgba(59, 130, 246, 0.16);
+                color: #bfdbfe;
+                font-size: 0.85rem;
+                letter-spacing: 0.06em;
+                text-transform: uppercase;
+            }
+            h1 {
+                margin: 1.8rem 0 1rem;
+                font-size: clamp(2.4rem, 6vw, 3rem);
+                letter-spacing: -0.03em;
+            }
+            p {
+                margin: 0 0 2.5rem;
+                color: #cbd5f5;
+                font-size: 1.05rem;
+                line-height: 1.6;
+            }
+            .actions {
+                display: flex;
+                justify-content: center;
+                gap: 1rem;
+                flex-wrap: wrap;
+            }
+            a {
+                text-decoration: none;
+                font-weight: 600;
+            }
+            .primary,
+            .secondary {
+                padding: 0.85rem 1.6rem;
+                border-radius: 12px;
+                transition: transform 160ms ease, box-shadow 160ms ease, opacity 160ms ease;
+            }
+            .primary {
+                background: linear-gradient(120deg, #38bdf8, #6366f1);
+                color: #0f172a;
+                box-shadow: 0 16px 35px rgba(99, 102, 241, 0.35);
+            }
+            .secondary {
+                border: 1px solid rgba(148, 163, 184, 0.35);
+                color: #e2e8f0;
+            }
+            .primary:hover,
+            .primary:focus-visible,
+            .secondary:hover,
+            .secondary:focus-visible {
+                transform: translateY(-2px);
+                box-shadow: 0 20px 40px rgba(99, 102, 241, 0.4);
+            }
+            .secondary:hover,
+            .secondary:focus-visible {
+                box-shadow: 0 14px 30px rgba(15, 23, 42, 0.35);
+            }
+            footer {
+                margin-top: 2.8rem;
+                font-size: 0.85rem;
+                color: rgba(226, 232, 240, 0.6);
+                letter-spacing: 0.04em;
+            }
+            @media (max-width: 540px) {
+                .card {
+                    padding: 2.6rem 2rem;
+                }
+                .actions {
+                    flex-direction: column;
+                }
+                .primary,
+                .secondary {
+                    width: 100%;
+                    justify-content: center;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <main class="card">
+            <div class="badge">
+                <span>404</span>
+                <span>Page Missing</span>
+            </div>
+            <h1>Well, that route isn&apos;t deployed yet.</h1>
+            <p>
+                Double-check the project slug or redeploy the service to make this endpoint available.
+                Once it&apos;s live, traffic will be routed here automatically.
+            </p>
+            <div class="actions" role="group">
+                <a class="primary" href="https://github.com/splax/localvercel" target="_blank" rel="noreferrer">View Platform Guide</a>
+                <a class="secondary" href="/">Back to Home</a>
+            </div>
+            <footer>peep · intelligent previews for every deploy</footer>
+        </main>
+    </body>
+    </html>
+  error-502.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Temporary Outage · peep</title>
+        <style>
+            :root {
+                color-scheme: light dark;
+            }
+            body {
+                margin: 0;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: radial-gradient(120% 140% at 50% 0%, #1a1034 0%, #0f172a 60%, #0b1120 100%);
+                color: #f5f7ff;
+                font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }
+            .card {
+                width: min(90vw, 520px);
+                padding: 3.5rem 3rem;
+                border-radius: 24px;
+                background: rgba(11, 17, 32, 0.75);
+                backdrop-filter: blur(18px);
+                box-shadow: 0 28px 70px rgba(15, 23, 42, 0.45);
+                border: 1px solid rgba(94, 129, 255, 0.25);
+                text-align: center;
+            }
+            .badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.5rem;
+                padding: 0.35rem 0.9rem;
+                border-radius: 999px;
+                background: rgba(96, 165, 250, 0.18);
+                color: #c7d2fe;
+                font-size: 0.85rem;
+                letter-spacing: 0.06em;
+                text-transform: uppercase;
+            }
+            h1 {
+                margin: 1.8rem 0 1rem;
+                font-size: clamp(2.4rem, 6vw, 3rem);
+                letter-spacing: -0.03em;
+            }
+            p {
+                margin: 0 0 2.4rem;
+                color: #dbe5ff;
+                font-size: 1.05rem;
+                line-height: 1.6;
+            }
+            .actions {
+                display: flex;
+                justify-content: center;
+                gap: 1rem;
+                flex-wrap: wrap;
+            }
+            a {
+                text-decoration: none;
+                font-weight: 600;
+            }
+            .primary,
+            .secondary {
+                padding: 0.85rem 1.6rem;
+                border-radius: 12px;
+                transition: transform 160ms ease, box-shadow 160ms ease, opacity 160ms ease;
+            }
+            .primary {
+                background: linear-gradient(120deg, #38bdf8, #a855f7);
+                color: #0f172a;
+                box-shadow: 0 18px 42px rgba(129, 140, 248, 0.4);
+            }
+            .secondary {
+                border: 1px solid rgba(148, 163, 184, 0.35);
+                color: #e2e8f0;
+            }
+            .primary:hover,
+            .primary:focus-visible,
+            .secondary:hover,
+            .secondary:focus-visible {
+                transform: translateY(-2px);
+                box-shadow: 0 22px 44px rgba(129, 140, 248, 0.45);
+            }
+            .secondary:hover,
+            .secondary:focus-visible {
+                box-shadow: 0 18px 36px rgba(15, 23, 42, 0.38);
+            }
+            footer {
+                margin-top: 2.6rem;
+                font-size: 0.85rem;
+                color: rgba(226, 232, 240, 0.6);
+                letter-spacing: 0.04em;
+            }
+            @media (max-width: 540px) {
+                .card {
+                    padding: 2.6rem 2rem;
+                }
+                .actions {
+                    flex-direction: column;
+                }
+                .primary,
+                .secondary {
+                    width: 100%;
+                    justify-content: center;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <main class="card">
+            <div class="badge">
+                <span>502</span>
+                <span>Service Unavailable</span>
+            </div>
+            <h1>Looks like the deployment is warming up.</h1>
+            <p>
+                The upstream instance isn&apos;t responding just yet. Give it a moment or redeploy if this state persists.
+                We&apos;ll restore the route automatically as soon as the service comes back online.
+            </p>
+            <div class="actions">
+                <a class="primary" href="https://github.com/splax/localvercel" target="_blank" rel="noreferrer">Check Deployment Guide</a>
+                <a class="secondary" href="mailto:support@peep.dev">Contact Support</a>
+            </div>
+            <footer>peep · intelligent previews for every deploy</footer>
+        </main>
+    </body>
+    </html>
