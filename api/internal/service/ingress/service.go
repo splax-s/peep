@@ -38,7 +38,7 @@ func New(cfg config.APIConfig, logger *slog.Logger) *Service {
 	dir := strings.TrimSpace(cfg.NginxConfigPath)
 	suffix := strings.TrimSpace(cfg.IngressDomainSuffix)
 	if suffix == "" {
-		suffix = ".local.peep"
+		suffix = ".peep.com"
 	}
 	service := &Service{
 		configDir:     dir,

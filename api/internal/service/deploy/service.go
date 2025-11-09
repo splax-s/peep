@@ -274,6 +274,17 @@ func (s Service) ProcessCallback(ctx context.Context, payload CallbackPayload) e
 
 	if strings.EqualFold(payload.Stage, "metrics") {
 		metadata := mergeMetadata(payload)
+		// Refresh deployment heartbeat so runtime TTL checks do not expire active workloads.
+		if err := s.deployments.UpdateDeploymentStatus(ctx, domain.DeploymentStatusUpdate{
+			DeploymentID: payload.DeploymentID,
+			Status:       status,
+		}); err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				return err
+			}
+			s.logger.Error("deployment heartbeat update failed", "deployment_id", payload.DeploymentID, "error", err)
+			return err
+		}
 		s.handleIngress(ctx, payload, metadata, status)
 		return nil
 	}
@@ -395,7 +406,7 @@ func (s Service) normalizeDeploymentURL(ctx context.Context, payload CallbackPay
 	}
 	suffix := strings.TrimSpace(s.cfg.IngressDomainSuffix)
 	if suffix == "" {
-		suffix = ".local.peep"
+		suffix = ".peep.com"
 	}
 	host := canonicalProjectHost(*project, suffix)
 	if host == "" {

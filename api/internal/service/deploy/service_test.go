@@ -63,7 +63,7 @@ func TestProcessCallbackPropagatesNotFound(t *testing.T) {
 	}
 }
 
-func TestProcessCallbackSkipsStatusUpdateForMetricsStage(t *testing.T) {
+func TestProcessCallbackRefreshesStatusForMetricsStage(t *testing.T) {
 	depRepo := &fakeDeploymentRepo{}
 	svc := newTestService(func(s *Service) {
 		s.deployments = depRepo
@@ -83,8 +83,17 @@ func TestProcessCallbackSkipsStatusUpdateForMetricsStage(t *testing.T) {
 	if err := svc.ProcessCallback(context.Background(), payload); err != nil {
 		t.Fatalf("ProcessCallback returned error: %v", err)
 	}
-	if depRepo.updateCalls != 0 {
-		t.Fatalf("expected no status updates for metrics stage, got %d", depRepo.updateCalls)
+	if depRepo.updateCalls != 1 {
+		t.Fatalf("expected one status update for metrics stage, got %d", depRepo.updateCalls)
+	}
+	if depRepo.lastUpdate.Status != StatusRunning {
+		t.Fatalf("expected status %q, got %q", StatusRunning, depRepo.lastUpdate.Status)
+	}
+	if depRepo.lastUpdate.Stage != "" {
+		t.Fatalf("expected stage to remain unchanged, got %q", depRepo.lastUpdate.Stage)
+	}
+	if len(depRepo.lastUpdate.Metadata) != 0 {
+		t.Fatal("expected no metadata stored for heartbeat update")
 	}
 }
 

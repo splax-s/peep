@@ -53,7 +53,7 @@ func LoadAPIConfig() APIConfig {
 		NginxConfigPath:          GetString("NGINX_CONFIG_PATH", "/etc/nginx/conf.d"),
 		NginxReloadCommand:       GetString("NGINX_RELOAD_COMMAND", ""),
 		NginxContainerName:       GetString("NGINX_CONTAINER_NAME", ""),
-		IngressDomainSuffix:      GetString("INGRESS_DOMAIN_SUFFIX", ".local.peep"),
+		IngressDomainSuffix:      GetString("INGRESS_DOMAIN_SUFFIX", ".peep.com"),
 		LogChannelName:           GetString("PG_LOG_CHANNEL", "project_logs"),
 		LogBuffer:                GetInt("WS_LOG_BUFFER", 100),
 		WebhookSecret:            GetString("GIT_WEBHOOK_SECRET", "supersecret"),

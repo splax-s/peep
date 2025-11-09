@@ -1,6 +1,9 @@
 package config
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // BuilderConfig holds runtime configuration for the builder service.
 type BuilderConfig struct {
@@ -23,6 +26,12 @@ type BuilderConfig struct {
 	CallbackSuppressionTTL  time.Duration
 	RuntimeTelemetryURL     string
 	RuntimeTelemetryTimeout time.Duration
+	RuntimeBackend          string
+	RuntimeNamespace        string
+	RuntimeServiceDomain    string
+	RuntimeServicePort      int
+	RuntimeReadyTimeout     time.Duration
+	RuntimeHeartbeat        time.Duration
 }
 
 // LoadBuilderConfig constructs a BuilderConfig from environment variables.
@@ -47,5 +56,11 @@ func LoadBuilderConfig() BuilderConfig {
 		CallbackSuppressionTTL:  time.Duration(GetInt("CALLBACK_SUPPRESSION_TTL_SECONDS", 600)) * time.Second,
 		RuntimeTelemetryURL:     GetString("RUNTIME_TELEMETRY_URL", ""),
 		RuntimeTelemetryTimeout: time.Duration(GetInt("RUNTIME_TELEMETRY_TIMEOUT_SECONDS", 5)) * time.Second,
+		RuntimeBackend:          strings.ToLower(strings.TrimSpace(GetString("RUNTIME_BACKEND", "docker"))),
+		RuntimeNamespace:        GetString("KUBERNETES_NAMESPACE", "peep"),
+		RuntimeServiceDomain:    GetString("RUNTIME_SERVICE_DOMAIN", "peep.svc.cluster.local"),
+		RuntimeServicePort:      GetInt("RUNTIME_SERVICE_PORT", 3000),
+		RuntimeReadyTimeout:     time.Duration(GetInt("RUNTIME_READY_TIMEOUT_SECONDS", 120)) * time.Second,
+		RuntimeHeartbeat:        time.Duration(GetInt("RUNTIME_HEARTBEAT_SECONDS", 15)) * time.Second,
 	}
 }

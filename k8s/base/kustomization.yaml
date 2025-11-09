@@ -9,6 +9,7 @@ resources:
   - redis.yaml
   - api.yaml
   - builder.yaml
+  - builder-rbac.yaml
   - dashboard.yaml
   - nginx.yaml
   - ingress.yaml

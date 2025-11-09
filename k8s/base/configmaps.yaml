@@ -10,7 +10,7 @@ data:
     API_ADDR: ":4000"
     BUILDER_URL: http://builder.peep.svc.cluster.local:5000
     NGINX_CONFIG_PATH: /var/lib/peep/nginx
-    INGRESS_DOMAIN_SUFFIX: .local.peep
+    INGRESS_DOMAIN_SUFFIX: .peep.com
     PG_LOG_CHANNEL: project_logs
     WS_LOG_BUFFER: "100"
     METRICS_SAMPLE_SECONDS: "10"
@@ -40,6 +40,12 @@ data:
     DEPLOY_CALLBACK_TIMEOUT_SECONDS: "10"
     METRICS_SAMPLE_SECONDS: "10"
     GIT_CLONE_DEPTH: "1"
+    RUNTIME_BACKEND: kubernetes
+    KUBERNETES_NAMESPACE: peep
+    RUNTIME_SERVICE_DOMAIN: peep.svc.cluster.local
+    RUNTIME_SERVICE_PORT: "3000"
+    RUNTIME_READY_TIMEOUT_SECONDS: "180"
+    RUNTIME_HEARTBEAT_SECONDS: "15"
 ---
 apiVersion: v1
 kind: ConfigMap

@@ -23,14 +23,16 @@ import (
 
 	"github.com/splax/localvercel/builder/internal/docker"
 	"github.com/splax/localvercel/builder/internal/git"
+	"github.com/splax/localvercel/builder/internal/runtime"
 	"github.com/splax/localvercel/builder/internal/workspace"
 	"github.com/splax/localvercel/pkg/config"
 	"github.com/splax/localvercel/pkg/runtime/telemetry"
 )
 
 const (
-	defaultAppPort      = nat.Port("3000/tcp")
-	defaultHostFallback = "host.docker.internal"
+	defaultAppPort       = nat.Port("3000/tcp")
+	defaultAppPortNumber = 3000
+	defaultHostFallback  = "host.docker.internal"
 )
 
 // Request contains deployment parameters from the API.
@@ -68,6 +70,8 @@ type Service struct {
 	logSuppressed    *sync.Map
 	telemetry        TelemetryEmitter
 	telemetryTimeout time.Duration
+	runtime          runtime.Manager
+	runtimeSessions  *sync.Map
 }
 
 type suppressionEntry struct {
@@ -131,7 +135,7 @@ func (s Service) attachBuilderToken(req *http.Request) {
 }
 
 // New creates a deployment service.
-func New(cli *docker.Client, ws *workspace.Manager, logger *slog.Logger, cfg config.BuilderConfig, telemetryEmitter TelemetryEmitter) Service {
+func New(cli *docker.Client, ws *workspace.Manager, logger *slog.Logger, cfg config.BuilderConfig, telemetryEmitter TelemetryEmitter, runtimeMgr runtime.Manager) Service {
 	timeout := cfg.DeployCallbackTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -159,6 +163,8 @@ func New(cli *docker.Client, ws *workspace.Manager, logger *slog.Logger, cfg con
 		logSuppressed:    &sync.Map{},
 		telemetry:        telemetryEmitter,
 		telemetryTimeout: telemetryTimeout,
+		runtime:          runtimeMgr,
+		runtimeSessions:  &sync.Map{},
 	}
 }
 
@@ -213,11 +219,18 @@ func (s Service) Cancel(ctx context.Context, deploymentID string) error {
 	if id == "" {
 		return fmt.Errorf("deployment id required")
 	}
-	if s.docker == nil {
-		return fmt.Errorf("docker client not initialised")
+	var cancelErr error
+	if s.runtime != nil && strings.EqualFold(s.cfg.RuntimeBackend, "kubernetes") {
+		s.stopRuntimeWatcher(id)
+		cancelErr = s.runtime.Cancel(ctx, id)
+	} else {
+		if s.docker == nil {
+			return fmt.Errorf("docker client not initialised")
+		}
+		cancelErr = s.docker.RemoveContainer(ctx, id)
 	}
-	if err := s.docker.RemoveContainer(ctx, id); err != nil {
-		return err
+	if cancelErr != nil {
+		return cancelErr
 	}
 	if s.workspace != nil {
 		if err := s.workspace.CleanupByID(id); err != nil {
@@ -437,6 +450,10 @@ func (s Service) execute(rootCtx context.Context, req Request, imageTag string) 
 		s.fail(req, imageTag, "run_command", err)
 		return
 	}
+	if s.runtime != nil && strings.EqualFold(s.cfg.RuntimeBackend, "kubernetes") {
+		s.launchKubernetesRuntime(ctx, req, imageTag, cmd, buildTail)
+		return
+	}
 
 	ports := nat.PortMap{
 		defaultAppPort: []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: ""}},
@@ -504,6 +521,166 @@ func (s Service) imageTag(req Request) string {
 		registry = "local" // deterministic fallback
 	}
 	return filepath.ToSlash(fmt.Sprintf("%s/%s:%s", registry, req.ProjectID, req.DeploymentID))
+}
+
+func (s Service) launchKubernetesRuntime(ctx context.Context, req Request, image string, command []string, buildTail []string) {
+	if s.runtime == nil {
+		s.fail(req, image, "runtime_backend", fmt.Errorf("runtime manager not initialised"))
+		return
+	}
+	metadata := map[string]any{
+		"deployment_id": req.DeploymentID,
+		"project_id":    req.ProjectID,
+	}
+	_ = s.notifyStatus(req, "starting", "container", "provisioning runtime workload", image, "", metadata, nil)
+	s.emitRuntimeEvent(ctx, req, "container_starting", "info", "provisioning runtime workload", metadata)
+	s.emitLog(req, "info", "provisioning runtime workload", metadata)
+
+	readyTimeout := s.cfg.RuntimeReadyTimeout
+	if readyTimeout <= 0 {
+		readyTimeout = 2 * time.Minute
+	}
+	runtimeReq := runtime.Request{
+		DeploymentID: req.DeploymentID,
+		ProjectID:    req.ProjectID,
+		Image:        image,
+		Command:      command,
+		Port:         defaultAppPortNumber,
+		Timeout:      readyTimeout,
+	}
+	deployment, err := s.runtime.Deploy(ctx, runtimeReq)
+	if err != nil {
+		s.fail(req, image, "runtime_deploy", err)
+		return
+	}
+
+	readyMeta := map[string]any{
+		"deployment_id":      req.DeploymentID,
+		"project_id":         req.ProjectID,
+		"container_id":       deployment.PodName,
+		"host_ip":            deployment.Host,
+		"host_port":          deployment.Port,
+		"runtime_deployment": deployment.DeploymentName,
+		"runtime_service":    deployment.ServiceName,
+		"runtime_pod":        deployment.PodName,
+		"runtime_started_at": deployment.StartedAt.Format(time.RFC3339),
+		"image":              image,
+	}
+	if len(buildTail) > 0 {
+		readyMeta["build_log_tail"] = buildTail
+	}
+
+	s.emitLog(req, "info", "runtime pod started", readyMeta)
+	s.emitRuntimeEvent(ctx, req, "container_started", "info", "runtime pod started", readyMeta)
+
+	_ = s.notifyStatus(req, "running", "ready", "deployment is running", image, "", readyMeta, nil)
+	s.emitRuntimeEvent(nil, req, "deployment_ready", "info", "deployment is running", readyMeta)
+
+	s.startRuntimeWatcher(req, deployment, image)
+}
+
+func (s Service) startRuntimeWatcher(req Request, deployment runtime.Deployment, image string) {
+	if s.runtime == nil {
+		return
+	}
+	s.stopRuntimeWatcher(req.DeploymentID)
+	interval := s.cfg.RuntimeHeartbeat
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.runtimeSessions.Store(req.DeploymentID, cancel)
+	go s.runtimeHeartbeat(ctx, interval, req, deployment, image)
+}
+
+func (s Service) stopRuntimeWatcher(deploymentID string) {
+	if value, ok := s.runtimeSessions.LoadAndDelete(deploymentID); ok {
+		if cancel, ok := value.(context.CancelFunc); ok {
+			cancel()
+		}
+	}
+}
+
+func (s Service) runtimeHeartbeat(ctx context.Context, interval time.Duration, req Request, deployment runtime.Deployment, image string) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	defer s.runtimeSessions.Delete(req.DeploymentID)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			podStatus, err := s.runtime.PodStatus(statusCtx, req.DeploymentID)
+			cancel()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				s.logger.Warn("runtime pod status failed", "deployment_id", req.DeploymentID, "project_id", req.ProjectID, "error", err)
+				continue
+			}
+
+			containerID := strings.TrimSpace(podStatus.ContainerID)
+			if containerID == "" {
+				containerID = deployment.PodName
+			}
+			metadata := map[string]any{
+				"deployment_id": req.DeploymentID,
+				"project_id":    req.ProjectID,
+				"container_id":  containerID,
+				"host_ip":       deployment.Host,
+				"host_port":     deployment.Port,
+				"phase":         strings.ToLower(podStatus.Phase),
+			}
+			if podStatus.CPUPercent > 0 {
+				metadata["cpu_percent"] = podStatus.CPUPercent
+			}
+			if podStatus.MemoryBytes > 0 {
+				metadata["memory_bytes"] = podStatus.MemoryBytes
+			}
+			if podStatus.StartedAt != nil {
+				metadata["runtime_started_at"] = podStatus.StartedAt.Format(time.RFC3339)
+			}
+
+			_ = s.notifyStatus(req, "running", "metrics", "runtime heartbeat", image, "", metadata, nil)
+			s.emitRuntimeEvent(nil, req, "runtime_metrics", "info", "runtime heartbeat", metadata)
+
+			if !strings.EqualFold(podStatus.Phase, "running") {
+				exitStatus := "stopped"
+				level := "info"
+				if strings.EqualFold(podStatus.Phase, "failed") {
+					exitStatus = "failed"
+					level = "error"
+				}
+				exitMeta := map[string]any{
+					"deployment_id": req.DeploymentID,
+					"project_id":    req.ProjectID,
+					"container_id":  containerID,
+					"host_ip":       deployment.Host,
+					"host_port":     deployment.Port,
+					"phase":         strings.ToLower(podStatus.Phase),
+				}
+				if podStatus.Reason != "" {
+					exitMeta["reason"] = podStatus.Reason
+				}
+				if podStatus.Message != "" {
+					exitMeta["message"] = podStatus.Message
+				}
+				message := "runtime pod completed"
+				if podStatus.Message != "" {
+					message = podStatus.Message
+				}
+				_ = s.notifyStatus(req, exitStatus, "container_exit", message, image, "", exitMeta, nil)
+				s.emitRuntimeEvent(nil, req, "container_exit", level, message, exitMeta)
+				if err := s.runtime.Cancel(context.Background(), req.DeploymentID); err != nil {
+					s.logger.Warn("runtime cleanup failed", "deployment_id", req.DeploymentID, "error", err)
+				}
+				return
+			}
+		}
+	}
 }
 
 func commandExecutable(command string) (string, error) {

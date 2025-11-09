@@ -13,6 +13,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go install github.com/pressly/goose/v3
 FROM alpine:3.20
 RUN addgroup -S peep && adduser -S peep -G peep
 RUN apk add --no-cache ca-certificates tzdata
+RUN mkdir -p /var/lib/peep/nginx /var/www/acme && chown -R peep:peep /var/lib/peep /var/www/acme
 WORKDIR /home/peep
 COPY --from=builder /out/api /usr/local/bin/api
 COPY --from=builder /go/bin/goose /usr/local/bin/goose

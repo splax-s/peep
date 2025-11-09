@@ -38,7 +38,7 @@ services:
       BUILDER_AUTH_TOKEN: dev-builder-token
       RATE_LIMIT_REDIS_ADDR: redis:6379
       NGINX_CONFIG_PATH: /workspace/nginx/conf.d
-      INGRESS_DOMAIN_SUFFIX: .local.peep
+      INGRESS_DOMAIN_SUFFIX: .peep.com
       NGINX_CONTAINER_NAME: peep-nginx
       DOCKER_HOST: unix:///var/run/docker.sock
       RUNTIME_DEPLOYMENT_TTL_SECONDS: "60"

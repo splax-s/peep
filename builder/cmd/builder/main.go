@@ -14,6 +14,8 @@ import (
 
 	"github.com/splax/localvercel/builder/internal/docker"
 	httpx "github.com/splax/localvercel/builder/internal/http"
+	"github.com/splax/localvercel/builder/internal/runtime"
+	"github.com/splax/localvercel/builder/internal/runtime/kubernetes"
 	"github.com/splax/localvercel/builder/internal/service/deploy"
 	"github.com/splax/localvercel/builder/internal/workspace"
 	"github.com/splax/localvercel/pkg/config"
@@ -57,7 +59,17 @@ func main() {
 		}
 	}
 
-	deploySvc := deploy.New(dockerClient, workspaceManager, log, cfg, runtimeEmitter)
+	var runtimeManager runtime.Manager
+	if cfg.RuntimeBackend == "kubernetes" {
+		mgr, err := kubernetes.New(cfg.RuntimeNamespace, cfg.RuntimeServiceDomain, cfg.RuntimeServicePort, cfg.RuntimeReadyTimeout, log)
+		if err != nil {
+			log.Error("kubernetes runtime manager init failed", "error", err)
+			os.Exit(1)
+		}
+		runtimeManager = mgr
+	}
+
+	deploySvc := deploy.New(dockerClient, workspaceManager, log, cfg, runtimeEmitter, runtimeManager)
 	router := httpx.New(log, deploySvc)
 
 	srv := &http.Server{
