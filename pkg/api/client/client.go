@@ -162,6 +162,54 @@ func (c *Client) Login(ctx context.Context, email, password string) (LoginRespon
 	return resp, nil
 }
 
+// DeviceStartResponse represents the payload returned when beginning device authorization.
+type DeviceStartResponse struct {
+	DeviceCode      string `json:"device_code"`
+	UserCode        string `json:"user_code"`
+	VerificationURL string `json:"verification_url"`
+	ExpiresIn       int    `json:"expires_in"`
+	Interval        int    `json:"interval"`
+}
+
+// DevicePollResponse represents the polled status of a device authorization request.
+type DevicePollResponse struct {
+	Status    string     `json:"status"`
+	ExpiresIn int        `json:"expires_in"`
+	Interval  int        `json:"interval"`
+	Tokens    *TokenPair `json:"tokens"`
+}
+
+// StartDeviceAuthorization initiates device-code login.
+func (c *Client) StartDeviceAuthorization(ctx context.Context) (DeviceStartResponse, error) {
+	var resp DeviceStartResponse
+	if err := c.do(ctx, http.MethodPost, "/auth/device/start", map[string]string{}, "", &resp); err != nil {
+		return DeviceStartResponse{}, err
+	}
+	return resp, nil
+}
+
+// VerifyDeviceAuthorization approves a pending device code using user credentials.
+func (c *Client) VerifyDeviceAuthorization(ctx context.Context, userCode, email, password string) error {
+	body := map[string]string{
+		"user_code": userCode,
+		"email":     email,
+		"password":  password,
+	}
+	return c.do(ctx, http.MethodPost, "/auth/device/verify", body, "", &struct{}{})
+}
+
+// PollDeviceAuthorization polls the API for device authorization status.
+func (c *Client) PollDeviceAuthorization(ctx context.Context, deviceCode string) (DevicePollResponse, error) {
+	body := map[string]string{
+		"device_code": deviceCode,
+	}
+	var resp DevicePollResponse
+	if err := c.do(ctx, http.MethodPost, "/auth/device/poll", body, "", &resp); err != nil {
+		return DevicePollResponse{}, err
+	}
+	return resp, nil
+}
+
 // Team represents a collaborative workspace.
 type Team struct {
 	ID             string    `json:"id"`

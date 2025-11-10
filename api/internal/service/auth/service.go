@@ -19,14 +19,15 @@ import (
 
 // Service handles authentication workflows.
 type Service struct {
-	users  repository.UserRepository
-	logger *slog.Logger
-	cfg    config.APIConfig
+	users       repository.UserRepository
+	deviceCodes repository.DeviceCodeRepository
+	logger      *slog.Logger
+	cfg         config.APIConfig
 }
 
 // New constructs a Service.
-func New(users repository.UserRepository, logger *slog.Logger, cfg config.APIConfig) Service {
-	return Service{users: users, logger: logger, cfg: cfg}
+func New(users repository.UserRepository, devices repository.DeviceCodeRepository, logger *slog.Logger, cfg config.APIConfig) Service {
+	return Service{users: users, deviceCodes: devices, logger: logger, cfg: cfg}
 }
 
 // TokenPair contains access and refresh tokens.

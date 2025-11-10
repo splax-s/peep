@@ -1,2 +1,3 @@
 - [x] Rebuild Docker image `peep/api:dev` with latest API changes (2025-11-10)
 - [x] Restart `api` deployment to pick up the new image (2025-11-10)
+- [ ] Implement CLI device-code login flow without browser dependency (2025-11-10)

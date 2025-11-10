@@ -85,3 +85,14 @@ type WebhookRepository interface {
 	UpsertWebhook(ctx context.Context, projectID string, secret []byte) error
 	GetWebhookSecret(ctx context.Context, projectID string) ([]byte, error)
 }
+
+// DeviceCodeRepository manages device authorization lifecycles.
+type DeviceCodeRepository interface {
+	CreateDeviceCode(ctx context.Context, code *domain.DeviceCode) error
+	GetDeviceCode(ctx context.Context, deviceCode string) (*domain.DeviceCode, error)
+	GetDeviceCodeByUserCode(ctx context.Context, userCode string) (*domain.DeviceCode, error)
+	MarkDeviceCodeApproved(ctx context.Context, deviceCode, userID string) (*domain.DeviceCode, error)
+	ConsumeDeviceCode(ctx context.Context, deviceCode string) (string, error)
+	MarkDeviceCodeExpired(ctx context.Context, deviceCode string) error
+	TouchDeviceCode(ctx context.Context, deviceCode string, ts time.Time) error
+}

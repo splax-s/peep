@@ -61,7 +61,7 @@ func main() {
 	logHub := ws.NewHub()
 	runtimeHub := ws.NewHub()
 
-	authSvc := auth.New(repo, log, cfg)
+	authSvc := auth.New(repo, repo, log, cfg)
 	teamSvc := team.New(repo, log)
 	projectSvc := project.New(repo, repo, log, cfg)
 	environmentSvc := environment.New(repo, repo, log, cfg)

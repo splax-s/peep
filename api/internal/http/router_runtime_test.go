@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -104,10 +105,12 @@ func TestHandleRuntimeEventsGetReturnsEvents(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", rr.Code)
 	}
-	if got := rr.Header().Get("X-RateLimit-Limit"); got != "240" {
+	expectedLimit := strconv.Itoa(rateLimitRuntimeRead)
+	if got := rr.Header().Get("X-RateLimit-Limit"); got != expectedLimit {
 		t.Fatalf("unexpected rate limit header: %q", got)
 	}
-	if got := rr.Header().Get("X-RateLimit-Remaining"); got != "237" {
+	expectedRemaining := strconv.Itoa(rateLimitRuntimeRead - 3)
+	if got := rr.Header().Get("X-RateLimit-Remaining"); got != expectedRemaining {
 		t.Fatalf("unexpected rate remaining header: %q", got)
 	}
 	if got := rr.Header().Get("X-RateLimit-Reset"); got != "1950000000" {
@@ -194,10 +197,10 @@ func TestHandleRuntimeEventsPostIngestsEvent(t *testing.T) {
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("expected status 202, got %d", rr.Code)
 	}
-	if rr.Header().Get("X-RateLimit-Limit") != "1000" {
+	if rr.Header().Get("X-RateLimit-Limit") != strconv.Itoa(rateLimitRuntimeWrite) {
 		t.Fatalf("unexpected rate limit header %q", rr.Header().Get("X-RateLimit-Limit"))
 	}
-	if rr.Header().Get("X-RateLimit-Remaining") != "990" {
+	if rr.Header().Get("X-RateLimit-Remaining") != strconv.Itoa(rateLimitRuntimeWrite-10) {
 		t.Fatalf("unexpected rate remaining header %q", rr.Header().Get("X-RateLimit-Remaining"))
 	}
 	if rr.Header().Get("X-RateLimit-Reset") != "1950000100" {
@@ -329,7 +332,7 @@ func TestHandleRuntimeEventsGetRateLimited(t *testing.T) {
 	if rr.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected status 429, got %d", rr.Code)
 	}
-	if rr.Header().Get("X-RateLimit-Limit") != "240" {
+	if rr.Header().Get("X-RateLimit-Limit") != strconv.Itoa(rateLimitRuntimeRead) {
 		t.Fatalf("unexpected limit header %q", rr.Header().Get("X-RateLimit-Limit"))
 	}
 	if rr.Header().Get("X-RateLimit-Remaining") != "0" {
@@ -384,7 +387,7 @@ func TestHandleRuntimeEventsPostRateLimited(t *testing.T) {
 	if rr.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected status 429, got %d", rr.Code)
 	}
-	if rr.Header().Get("X-RateLimit-Limit") != "1000" {
+	if rr.Header().Get("X-RateLimit-Limit") != strconv.Itoa(rateLimitRuntimeWrite) {
 		t.Fatalf("unexpected limit header %q", rr.Header().Get("X-RateLimit-Limit"))
 	}
 	if rr.Header().Get("X-RateLimit-Remaining") != "0" {
@@ -434,10 +437,10 @@ func TestHandleRuntimeMetricsGetReturnsRollups(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", rr.Code)
 	}
-	if rr.Header().Get("X-RateLimit-Limit") != "240" {
+	if rr.Header().Get("X-RateLimit-Limit") != strconv.Itoa(rateLimitRuntimeRead) {
 		t.Fatalf("unexpected rate limit header %q", rr.Header().Get("X-RateLimit-Limit"))
 	}
-	if rr.Header().Get("X-RateLimit-Remaining") != "233" {
+	if rr.Header().Get("X-RateLimit-Remaining") != strconv.Itoa(rateLimitRuntimeRead-7) {
 		t.Fatalf("unexpected rate remaining header %q", rr.Header().Get("X-RateLimit-Remaining"))
 	}
 	if rr.Header().Get("X-RateLimit-Reset") != "1950000200" {
@@ -507,10 +510,10 @@ func TestHandleRuntimeMetricsInvalidBucketSpan(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d", rr.Code)
 	}
-	if rr.Header().Get("X-RateLimit-Limit") != "240" {
+	if rr.Header().Get("X-RateLimit-Limit") != strconv.Itoa(rateLimitRuntimeRead) {
 		t.Fatalf("expected rate limit header present")
 	}
-	if rr.Header().Get("X-RateLimit-Remaining") != "236" {
+	if rr.Header().Get("X-RateLimit-Remaining") != strconv.Itoa(rateLimitRuntimeRead-4) {
 		t.Fatalf("unexpected remaining header %q", rr.Header().Get("X-RateLimit-Remaining"))
 	}
 	if rr.Header().Get("X-RateLimit-Reset") != "1950000500" {
@@ -832,6 +835,30 @@ type userRepoStub struct {
 	users map[string]*domain.User
 }
 
+type deviceCodeRepoStub struct{}
+
+func (deviceCodeRepoStub) CreateDeviceCode(context.Context, *domain.DeviceCode) error { return nil }
+
+func (deviceCodeRepoStub) GetDeviceCode(context.Context, string) (*domain.DeviceCode, error) {
+	return nil, repository.ErrNotFound
+}
+
+func (deviceCodeRepoStub) GetDeviceCodeByUserCode(context.Context, string) (*domain.DeviceCode, error) {
+	return nil, repository.ErrNotFound
+}
+
+func (deviceCodeRepoStub) MarkDeviceCodeApproved(context.Context, string, string) (*domain.DeviceCode, error) {
+	return nil, repository.ErrInvalidArgument
+}
+
+func (deviceCodeRepoStub) ConsumeDeviceCode(context.Context, string) (string, error) {
+	return "", repository.ErrInvalidArgument
+}
+
+func (deviceCodeRepoStub) MarkDeviceCodeExpired(context.Context, string) error { return nil }
+
+func (deviceCodeRepoStub) TouchDeviceCode(context.Context, string, time.Time) error { return nil }
+
 func newUserRepoStub() *userRepoStub {
 	return &userRepoStub{users: make(map[string]*domain.User)}
 }
@@ -881,7 +908,7 @@ func setupRouterWithRuntime(t *testing.T, repo *runtimeRepoStub, limiter *rateLi
 		AccessTokenTTL:  time.Hour,
 		RefreshTokenTTL: 24 * time.Hour,
 	}
-	authSvc := auth.New(userRepo, logger, cfg)
+	authSvc := auth.New(userRepo, deviceCodeRepoStub{}, logger, cfg)
 
 	router := &Router{
 		logger:       logger,

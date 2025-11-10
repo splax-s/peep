@@ -1,0 +1,81 @@
+project_name: peep
+
+before:
+  hooks:
+    - node cmd/peep/npm/scripts/update-version.js {{ .Version }}
+
+builds:
+  - id: peep
+    main: ./cmd/peep
+    binary: peep
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.buildVersion={{ .Version }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: '{{ .CommitDate }}'
+    asmflags:
+      - all=-trimpath={{ .ProjectDir }}
+    gcflags:
+      - all=-trimpath={{ .ProjectDir }}
+
+archives:
+  - id: peep-archives
+    builds:
+      - peep
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    format: tar.gz
+    wrap_in_directory: false
+    files:
+      - cmd/peep/README.md
+      - docs/releasing-cli.md
+
+checksum:
+  name_template: '{{ .ProjectName }}_{{ .Version }}_checksums.txt'
+
+brews:
+  - tap:
+      owner: splax-s
+      name: homebrew-peep
+    name: peep
+    description: CLI for the peep platform
+    homepage: https://peep.com
+    license: MIT
+    install: |
+      bin.install "peep"
+    test: |
+      system "#{bin}/peep", "version"
+
+publishers:
+  - name: npm
+    cmd: bash
+    args:
+      - -c
+      - |
+        if [ -n "${SKIP_NPM}" ]; then
+          echo "SKIP_NPM set, skipping npm publish." >&2
+          exit 0
+        fi
+        if [ -z "${NPM_TOKEN}" ]; then
+          echo "NPM_TOKEN not set, skipping npm publish." >&2
+          exit 0
+        fi
+        npm publish cmd/peep/npm --access public
+    env:
+      - NODE_AUTH_TOKEN={{ .Env.NPM_TOKEN }}
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^chore:'

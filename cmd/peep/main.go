@@ -20,6 +20,8 @@ type cliConfig struct {
 	AccessToken string `json:"access_token"`
 }
 
+var buildVersion = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -36,6 +38,9 @@ func main() {
 		err = commandProject(args)
 	case "deploy":
 		err = commandDeploy(args)
+	case "version", "--version", "-v":
+		printVersion()
+		return
 	case "help", "-h", "--help":
 		printUsage()
 		return
@@ -55,6 +60,7 @@ func commandLogin(args []string) error {
 	email := fs.String("email", "", "Email address")
 	password := fs.String("password", "", "Password (supply to avoid prompt)")
 	apiBase := fs.String("api", "", "API base URL (default http://localhost:4000)")
+	useDevice := fs.Bool("device", true, "Use device-code flow (set to false for legacy login)")
 	fs.Parse(args)
 
 	if strings.TrimSpace(*email) == "" {
@@ -84,20 +90,90 @@ func commandLogin(args []string) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+	if !*useDevice {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		resp, err := client.Login(ctx, *email, secret)
+		if err != nil {
+			return err
+		}
+		cfg.AccessToken = resp.Tokens.AccessToken
+		if err := saveConfig(cfg); err != nil {
+			return err
+		}
+		fmt.Println("login successful")
+		return nil
+	}
 
-	resp, err := client.Login(ctx, *email, secret)
+	tokens, err := deviceLogin(context.Background(), client, *email, secret)
 	if err != nil {
 		return err
 	}
-
-	cfg.AccessToken = resp.Tokens.AccessToken
+	cfg.AccessToken = tokens.AccessToken
 	if err := saveConfig(cfg); err != nil {
 		return err
 	}
 	fmt.Println("login successful")
 	return nil
+}
+
+func deviceLogin(ctx context.Context, client *apiclient.Client, email, password string) (apiclient.TokenPair, error) {
+	startCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	start, err := client.StartDeviceAuthorization(startCtx)
+	cancel()
+	if err != nil {
+		return apiclient.TokenPair{}, err
+	}
+	expires := time.Duration(start.ExpiresIn) * time.Second
+	if expires <= 0 {
+		expires = 10 * time.Minute
+	}
+	interval := time.Duration(start.Interval) * time.Second
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	deadline := time.Now().Add(expires)
+	fmt.Printf("Device verification code: %s\n", start.UserCode)
+	fmt.Printf("Verification URL: %s\n", start.VerificationURL)
+	fmt.Println("Approving device...")
+
+	verifyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	if err := client.VerifyDeviceAuthorization(verifyCtx, start.UserCode, email, password); err != nil {
+		cancel()
+		return apiclient.TokenPair{}, err
+	}
+	cancel()
+	fmt.Println("Authorization pending, polling for tokens...")
+
+	for {
+		if time.Now().After(deadline) {
+			return apiclient.TokenPair{}, errors.New("authorization timed out")
+		}
+		pollCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		resp, err := client.PollDeviceAuthorization(pollCtx, start.DeviceCode)
+		cancel()
+		if err != nil {
+			return apiclient.TokenPair{}, err
+		}
+		switch strings.ToLower(resp.Status) {
+		case "approved":
+			if resp.Tokens == nil {
+				return apiclient.TokenPair{}, errors.New("authorization approved but tokens unavailable")
+			}
+			return *resp.Tokens, nil
+		case "pending":
+			if resp.Interval > 0 {
+				interval = time.Duration(resp.Interval) * time.Second
+			}
+		case "expired":
+			return apiclient.TokenPair{}, errors.New("device code expired")
+		case "consumed":
+			return apiclient.TokenPair{}, errors.New("device code already used")
+		default:
+			return apiclient.TokenPair{}, fmt.Errorf("unexpected device status: %s", resp.Status)
+		}
+		time.Sleep(interval)
+	}
 }
 
 func commandProject(args []string) error {
@@ -370,14 +446,18 @@ func configPath() (string, error) {
 }
 
 func printUsage() {
-	fmt.Print(`peep CLI
-
-Usage:
+	fmt.Printf("peep CLI %s\n\n", buildVersion)
+	fmt.Print(`Usage:
 	peep login --email user@example.com [--password secret] [--api http://localhost:4000]
 	peep project list --team <team-id>
 	peep project create --team <team-id> --name <name> --repo <url> [--type frontend|backend] [--build cmd] [--run cmd]
 	peep deploy trigger --project <project-id> [--commit sha]
 	peep deploy list --project <project-id> [--limit N]
 	peep deploy delete --deployment <deployment-id>
+	peep version
 `)
+}
+
+func printVersion() {
+	fmt.Println(strings.TrimSpace(buildVersion))
 }

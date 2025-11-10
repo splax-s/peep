@@ -40,6 +40,10 @@ type APIConfig struct {
 	RuntimeMemoryLimitMB     int
 	RuntimeMetricBucketSpan  time.Duration
 	RuntimeMetricFlushEvery  time.Duration
+	DeviceVerificationURL    string
+	DeviceCodeTTL            time.Duration
+	DeviceCodePollInterval   time.Duration
+	DeviceCodeUserCodeLength int
 }
 
 // LoadAPIConfig constructs an APIConfig from environment variables.
@@ -78,5 +82,9 @@ func LoadAPIConfig() APIConfig {
 		RuntimeMemoryLimitMB:     GetInt("RUNTIME_MEMORY_LIMIT_MB", 512),
 		RuntimeMetricBucketSpan:  time.Duration(GetInt("RUNTIME_METRIC_BUCKET_SECONDS", 60)) * time.Second,
 		RuntimeMetricFlushEvery:  time.Duration(GetInt("RUNTIME_METRIC_FLUSH_SECONDS", 30)) * time.Second,
+		DeviceVerificationURL:    GetString("DEVICE_VERIFICATION_URL", "https://dashboard.peep.com/device"),
+		DeviceCodeTTL:            time.Duration(GetInt("DEVICE_CODE_TTL_SECONDS", 600)) * time.Second,
+		DeviceCodePollInterval:   time.Duration(GetInt("DEVICE_CODE_POLL_INTERVAL_SECONDS", 5)) * time.Second,
+		DeviceCodeUserCodeLength: GetInt("DEVICE_CODE_USER_CODE_LENGTH", 8),
 	}
 }

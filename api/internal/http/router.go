@@ -123,6 +123,9 @@ func (r *Router) register() {
 	r.mux.HandleFunc("/healthz", r.audit("/healthz", r.handleHealthz))
 	r.mux.HandleFunc("/auth/signup", r.audit("/auth/signup", r.withRateLimit("/auth/signup", rateLimitSignup, rateWindowDefault, rateLimitKeyIP, r.handleSignup)))
 	r.mux.HandleFunc("/auth/login", r.audit("/auth/login", r.withRateLimit("/auth/login", rateLimitLogin, rateWindowDefault, rateLimitKeyIP, r.handleLogin)))
+	r.mux.HandleFunc("/auth/device/start", r.audit("/auth/device/start", r.withRateLimit("/auth/device/start", rateLimitLogin, rateWindowDefault, rateLimitKeyIP, r.handleDeviceStart)))
+	r.mux.HandleFunc("/auth/device/verify", r.audit("/auth/device/verify", r.withRateLimit("/auth/device/verify", rateLimitLogin, rateWindowDefault, rateLimitKeyIP, r.handleDeviceVerify)))
+	r.mux.HandleFunc("/auth/device/poll", r.audit("/auth/device/poll", r.withRateLimit("/auth/device/poll", rateLimitLogin, rateWindowDefault, rateLimitKeyIP, r.handleDevicePoll)))
 	r.mux.HandleFunc("/teams", r.audit("/teams", r.handlerAuthRate("/teams", rateLimitUserWrite, rateWindowDefault, r.handleTeams)))
 	r.mux.HandleFunc("/projects", r.audit("/projects", r.handlerAuthRate("/projects", rateLimitUserWrite, rateWindowDefault, r.handleProjects)))
 	r.mux.HandleFunc("/projects/", r.audit("/projects/:id", r.handlerAuthRate("/projects/:id", rateLimitUserWrite, rateWindowDefault, r.handleProjectSubroutes)))
@@ -192,6 +195,138 @@ func (r *Router) handleLogin(w http.ResponseWriter, req *http.Request) {
 		},
 		"tokens": tokens,
 	})
+}
+
+func (r *Router) handleDeviceStart(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		r.methodNotAllowed(w)
+		return
+	}
+	var payload struct {
+		Client string `json:"client"`
+	}
+	if req.Body != nil {
+		decoder := json.NewDecoder(req.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+	}
+	code, err := r.auth.StartDeviceAuthorization(req.Context())
+	if err != nil {
+		switch {
+		case errors.Is(err, auth.ErrDeviceAuthDisabled):
+			writeError(w, http.StatusServiceUnavailable, "device authorization disabled")
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	expiresIn := int(time.Until(code.ExpiresAt).Seconds())
+	if expiresIn < 0 {
+		expiresIn = 0
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"device_code":      code.DeviceCode,
+		"user_code":        code.UserCode,
+		"verification_url": code.VerificationURL,
+		"expires_in":       expiresIn,
+		"interval":         code.IntervalSeconds,
+	})
+}
+
+func (r *Router) handleDeviceVerify(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		r.methodNotAllowed(w)
+		return
+	}
+	var payload struct {
+		UserCode string `json:"user_code"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	decoder := json.NewDecoder(req.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	payload.UserCode = strings.TrimSpace(payload.UserCode)
+	payload.Email = strings.TrimSpace(payload.Email)
+	payload.Password = strings.TrimSpace(payload.Password)
+	if payload.UserCode == "" || payload.Email == "" || payload.Password == "" {
+		writeError(w, http.StatusBadRequest, "user_code, email and password are required")
+		return
+	}
+	if _, err := r.auth.VerifyDeviceCode(req.Context(), payload.UserCode, payload.Email, payload.Password); err != nil {
+		switch {
+		case errors.Is(err, auth.ErrDeviceAuthDisabled):
+			writeError(w, http.StatusServiceUnavailable, "device authorization disabled")
+		case errors.Is(err, auth.ErrDeviceCodeInvalid):
+			writeError(w, http.StatusBadRequest, "invalid device code")
+		case errors.Is(err, auth.ErrDeviceCodeExpired):
+			writeError(w, http.StatusGone, "device code expired")
+		case errors.Is(err, auth.ErrDeviceCodeConsumed):
+			writeError(w, http.StatusConflict, "device code already used")
+		case errors.Is(err, repository.ErrNotFound):
+			writeError(w, http.StatusUnauthorized, "invalid credentials")
+		default:
+			writeError(w, http.StatusUnauthorized, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "approved"})
+}
+
+func (r *Router) handleDevicePoll(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		r.methodNotAllowed(w)
+		return
+	}
+	var payload struct {
+		DeviceCode string `json:"device_code"`
+	}
+	decoder := json.NewDecoder(req.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	payload.DeviceCode = strings.TrimSpace(payload.DeviceCode)
+	if payload.DeviceCode == "" {
+		writeError(w, http.StatusBadRequest, "device_code is required")
+		return
+	}
+	result, err := r.auth.PollDeviceCode(req.Context(), payload.DeviceCode)
+	switch {
+	case errors.Is(err, auth.ErrDeviceAuthDisabled):
+		writeError(w, http.StatusServiceUnavailable, "device authorization disabled")
+		return
+	case errors.Is(err, auth.ErrDeviceCodeInvalid):
+		writeError(w, http.StatusBadRequest, "invalid device code")
+		return
+	case err != nil && !errors.Is(err, auth.ErrDeviceCodePending) && !errors.Is(err, auth.ErrDeviceCodeExpired) && !errors.Is(err, auth.ErrDeviceCodeConsumed):
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	expiresIn := int(result.ExpiresIn / time.Second)
+	if expiresIn < 0 {
+		expiresIn = 0
+	}
+	interval := int(result.Interval / time.Second)
+	if interval <= 0 {
+		interval = 5
+	}
+	response := map[string]any{
+		"status":     result.Status,
+		"expires_in": expiresIn,
+		"interval":   interval,
+	}
+	if result.Tokens != nil {
+		response["tokens"] = result.Tokens
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (r *Router) handleTeams(w http.ResponseWriter, req *http.Request) {

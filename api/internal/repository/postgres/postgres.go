@@ -37,6 +37,7 @@ var (
 	_ repository.WebhookRepository      = (*Repository)(nil)
 	_ repository.ContainerRepository    = (*Repository)(nil)
 	_ repository.RuntimeEventRepository = (*Repository)(nil)
+	_ repository.DeviceCodeRepository   = (*Repository)(nil)
 )
 
 // CreateUser inserts a user.

@@ -1,0 +1,33 @@
+{
+  "name": "peep",
+  "version": "0.0.0",
+  "description": "Command line interface for the peep platform",
+  "bin": {
+    "peep": "bin/peep.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "keywords": [
+    "peep",
+    "cli",
+    "kubernetes",
+    "deploy"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/splax-s/peep.git"
+  },
+  "bugs": {
+    "url": "https://github.com/splax-s/peep/issues"
+  },
+  "homepage": "https://peep.com",
+  "author": "peep",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "tar": "^6.2.0"
+  }
+}
