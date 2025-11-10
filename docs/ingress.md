@@ -24,6 +24,7 @@ Environment variables for the API service control ingress behaviour:
 | --- | --- | --- |
 | `NGINX_CONFIG_PATH` | Directory where configs are written. Should be shared with the proxy process. | `/workspace/nginx/conf.d` in docker-compose |
 | `INGRESS_DOMAIN_SUFFIX` | Host suffix appended to project slugs. | `.peep.com` |
+| `INGRESS_PUBLIC_PORT` | External port appended to generated URLs. Set to `0` to omit. | `8080` |
 | `NGINX_RELOAD_COMMAND` | Optional shell command executed after config changes to reload the proxy. Leave empty if Docker-based reloads are configured. | _empty_ |
 | `NGINX_CONTAINER_NAME` | Name of the proxy container to signal with `SIGHUP` via the Docker socket when no reload command is supplied. | `peep-nginx` |
 
@@ -39,7 +40,7 @@ docker compose exec nginx ls /etc/nginx/conf.d
 docker compose exec nginx nginx -s reload
 ```
 
-Access the deployment via `http://<project-slug>.peep.com:8080` (the compose file maps container port 80 to host 8080). Automatic reloads are handled through the Docker socket; if you prefer a shell-based command, set `NGINX_RELOAD_COMMAND` and omit `NGINX_CONTAINER_NAME`.
+Access the deployment via `http://<project-slug>.peep.com:8080` (the compose file maps container port 80 to host 8080 and sets `INGRESS_PUBLIC_PORT=8080`). In Kubernetes or other ingress controllers, set `INGRESS_PUBLIC_PORT=0` to omit the port and rely on standard 80/443 routing. Automatic reloads are handled through the Docker socket; if you prefer a shell-based command, set `NGINX_RELOAD_COMMAND` and omit `NGINX_CONTAINER_NAME`.
 
 > **Note:** The generated configs default to proxying via `host.docker.internal`. On Linux hosts where this alias is unavailable, update the ingress service template or provide a fixed host IP before reloading the proxy.
 

@@ -39,6 +39,7 @@ services:
       RATE_LIMIT_REDIS_ADDR: redis:6379
       NGINX_CONFIG_PATH: /workspace/nginx/conf.d
       INGRESS_DOMAIN_SUFFIX: .peep.com
+      INGRESS_PUBLIC_PORT: "8080"
       NGINX_CONTAINER_NAME: peep-nginx
       DOCKER_HOST: unix:///var/run/docker.sock
       RUNTIME_DEPLOYMENT_TTL_SECONDS: "60"

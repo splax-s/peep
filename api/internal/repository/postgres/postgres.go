@@ -804,6 +804,16 @@ func int64PtrToNil(v *int64) any {
 	return *v
 }
 
+func timePtrToNil(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	if t.IsZero() {
+		return nil
+	}
+	return t.UTC()
+}
+
 // InsertRuntimeEvent persists a runtime telemetry event.
 func (r *Repository) InsertRuntimeEvent(ctx context.Context, event *domain.RuntimeEvent) error {
 	if event == nil {
@@ -1242,18 +1252,21 @@ func (r *Repository) GetWebhookSecret(ctx context.Context, projectID string) ([]
 }
 
 // UpsertContainer records container metadata for a project.
+
 func (r *Repository) UpsertContainer(ctx context.Context, container domain.ProjectContainer) error {
-	const query = `INSERT INTO project_containers (project_id, deployment_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
-		ON CONFLICT (container_id) DO UPDATE SET
-				deployment_id = EXCLUDED.deployment_id,
-				status = EXCLUDED.status,
-				cpu_percent = EXCLUDED.cpu_percent,
-				memory_bytes = EXCLUDED.memory_bytes,
-				uptime_seconds = EXCLUDED.uptime_seconds,
-				host_ip = EXCLUDED.host_ip,
-				host_port = EXCLUDED.host_port,
-			updated_at = NOW()`
+	const query = `INSERT INTO project_containers (project_id, deployment_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, last_heartbeat_at, ttl_expires_at, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+	ON CONFLICT (container_id) DO UPDATE SET
+			deployment_id = EXCLUDED.deployment_id,
+			status = EXCLUDED.status,
+			cpu_percent = EXCLUDED.cpu_percent,
+			memory_bytes = EXCLUDED.memory_bytes,
+			uptime_seconds = EXCLUDED.uptime_seconds,
+			host_ip = EXCLUDED.host_ip,
+			host_port = EXCLUDED.host_port,
+			last_heartbeat_at = COALESCE(EXCLUDED.last_heartbeat_at, project_containers.last_heartbeat_at),
+			ttl_expires_at = COALESCE(EXCLUDED.ttl_expires_at, project_containers.ttl_expires_at),
+		updated_at = NOW()`
 	_, err := r.pool.Exec(ctx, query,
 		container.ProjectID,
 		emptyToNil(container.DeploymentID),
@@ -1264,6 +1277,8 @@ func (r *Repository) UpsertContainer(ctx context.Context, container domain.Proje
 		int64PtrToNil(container.UptimeSeconds),
 		emptyToNil(container.HostIP),
 		intToNil(container.HostPort),
+		timePtrToNil(container.LastHeartbeatAt),
+		timePtrToNil(container.TTLExpiresAt),
 	)
 	return err
 }
@@ -1284,7 +1299,7 @@ func (r *Repository) DeleteContainersByDeployment(ctx context.Context, deploymen
 
 // ListProjectContainers returns containers associated with a project.
 func (r *Repository) ListProjectContainers(ctx context.Context, projectID string) ([]domain.ProjectContainer, error) {
-	const query = `SELECT id, project_id, deployment_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, created_at, updated_at
+	const query = `SELECT id, project_id, deployment_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, last_heartbeat_at, ttl_expires_at, created_at, updated_at
 		FROM project_containers WHERE project_id = $1 ORDER BY created_at DESC`
 	rows, err := r.pool.Query(ctx, query, projectID)
 	if err != nil {
@@ -1296,13 +1311,15 @@ func (r *Repository) ListProjectContainers(ctx context.Context, projectID string
 	for rows.Next() {
 		var c domain.ProjectContainer
 		var (
-			cpu      sql.NullFloat64
-			mem      sql.NullInt64
-			uptime   sql.NullInt64
-			hostIP   sql.NullString
-			hostPort sql.NullInt64
+			cpu           sql.NullFloat64
+			mem           sql.NullInt64
+			uptime        sql.NullInt64
+			hostIP        sql.NullString
+			hostPort      sql.NullInt64
+			lastHeartbeat sql.NullTime
+			ttlExpires    sql.NullTime
 		)
-		if err := rows.Scan(&c.ID, &c.ProjectID, &c.DeploymentID, &c.ContainerID, &c.Status, &cpu, &mem, &uptime, &hostIP, &hostPort, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.ProjectID, &c.DeploymentID, &c.ContainerID, &c.Status, &cpu, &mem, &uptime, &hostIP, &hostPort, &lastHeartbeat, &ttlExpires, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if cpu.Valid {
@@ -1323,6 +1340,14 @@ func (r *Repository) ListProjectContainers(ctx context.Context, projectID string
 		if hostPort.Valid {
 			c.HostPort = int(hostPort.Int64)
 		}
+		if lastHeartbeat.Valid {
+			value := lastHeartbeat.Time.UTC()
+			c.LastHeartbeatAt = &value
+		}
+		if ttlExpires.Valid {
+			value := ttlExpires.Time.UTC()
+			c.TTLExpiresAt = &value
+		}
 		containers = append(containers, c)
 	}
 	return containers, rows.Err()
@@ -1330,7 +1355,7 @@ func (r *Repository) ListProjectContainers(ctx context.Context, projectID string
 
 // ListContainers returns all tracked containers.
 func (r *Repository) ListContainers(ctx context.Context) ([]domain.ProjectContainer, error) {
-	const query = `SELECT id, project_id, deployment_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, created_at, updated_at FROM project_containers`
+	const query = `SELECT id, project_id, deployment_id, container_id, status, cpu_percent, memory_bytes, uptime_seconds, host_ip, host_port, last_heartbeat_at, ttl_expires_at, created_at, updated_at FROM project_containers`
 	rows, err := r.pool.Query(ctx, query)
 	if err != nil {
 		return nil, err
@@ -1341,13 +1366,15 @@ func (r *Repository) ListContainers(ctx context.Context) ([]domain.ProjectContai
 	for rows.Next() {
 		var c domain.ProjectContainer
 		var (
-			cpu      sql.NullFloat64
-			mem      sql.NullInt64
-			uptime   sql.NullInt64
-			hostIP   sql.NullString
-			hostPort sql.NullInt64
+			cpu           sql.NullFloat64
+			mem           sql.NullInt64
+			uptime        sql.NullInt64
+			hostIP        sql.NullString
+			hostPort      sql.NullInt64
+			lastHeartbeat sql.NullTime
+			ttlExpires    sql.NullTime
 		)
-		if err := rows.Scan(&c.ID, &c.ProjectID, &c.DeploymentID, &c.ContainerID, &c.Status, &cpu, &mem, &uptime, &hostIP, &hostPort, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.ProjectID, &c.DeploymentID, &c.ContainerID, &c.Status, &cpu, &mem, &uptime, &hostIP, &hostPort, &lastHeartbeat, &ttlExpires, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if cpu.Valid {
@@ -1367,6 +1394,14 @@ func (r *Repository) ListContainers(ctx context.Context) ([]domain.ProjectContai
 		}
 		if hostPort.Valid {
 			c.HostPort = int(hostPort.Int64)
+		}
+		if lastHeartbeat.Valid {
+			value := lastHeartbeat.Time.UTC()
+			c.LastHeartbeatAt = &value
+		}
+		if ttlExpires.Valid {
+			value := ttlExpires.Time.UTC()
+			c.TTLExpiresAt = &value
 		}
 		containers = append(containers, c)
 	}

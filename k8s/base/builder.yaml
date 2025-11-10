@@ -70,6 +70,8 @@ spec:
               mountPath: /tmp/peep
             - name: docker-sock
               mountPath: /var/run/docker.sock
+            - name: nginx-generated
+              mountPath: /var/lib/peep/nginx
           resources:
             requests:
               cpu: 250m
@@ -84,6 +86,9 @@ spec:
           hostPath:
             path: /var/run/docker.sock
             type: Socket
+        - name: nginx-generated
+          persistentVolumeClaim:
+            claimName: nginx-generated
 ---
 apiVersion: v1
 kind: ServiceAccount

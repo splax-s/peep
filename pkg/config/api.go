@@ -1,6 +1,9 @@
 package config
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // APIConfig holds runtime configuration for the API service.
 type APIConfig struct {
@@ -18,6 +21,8 @@ type APIConfig struct {
 	NginxReloadCommand       string
 	NginxContainerName       string
 	IngressDomainSuffix      string
+	IngressPublicPort        int
+	IngressDefaultScheme     string
 	LogChannelName           string
 	LogBuffer                int
 	WebhookSecret            string
@@ -54,6 +59,8 @@ func LoadAPIConfig() APIConfig {
 		NginxReloadCommand:       GetString("NGINX_RELOAD_COMMAND", ""),
 		NginxContainerName:       GetString("NGINX_CONTAINER_NAME", ""),
 		IngressDomainSuffix:      GetString("INGRESS_DOMAIN_SUFFIX", ".peep.com"),
+		IngressPublicPort:        GetInt("INGRESS_PUBLIC_PORT", 8080),
+		IngressDefaultScheme:     strings.ToLower(strings.TrimSpace(GetString("INGRESS_DEFAULT_SCHEME", ""))),
 		LogChannelName:           GetString("PG_LOG_CHANNEL", "project_logs"),
 		LogBuffer:                GetInt("WS_LOG_BUFFER", 100),
 		WebhookSecret:            GetString("GIT_WEBHOOK_SECRET", "supersecret"),

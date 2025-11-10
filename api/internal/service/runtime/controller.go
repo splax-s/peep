@@ -155,12 +155,32 @@ func (c *Controller) handleContainers(ctx context.Context, now time.Time, contai
 		return touched
 	}
 	removed := make(map[string]struct{})
-	cutoff := now.Add(-c.containerTTL)
 	for _, container := range containers {
 		if _, already := removed[container.ContainerID]; already {
 			continue
 		}
-		if c.containerTTL > 0 && container.UpdatedAt.Before(cutoff) {
+		var heartbeatInfo, ttlInfo string
+		if container.LastHeartbeatAt != nil && !container.LastHeartbeatAt.IsZero() {
+			heartbeatInfo = container.LastHeartbeatAt.UTC().Format(time.RFC3339Nano)
+		}
+		if container.TTLExpiresAt != nil && !container.TTLExpiresAt.IsZero() {
+			ttlInfo = container.TTLExpiresAt.UTC().Format(time.RFC3339Nano)
+		}
+		expired := false
+		if container.TTLExpiresAt != nil && !container.TTLExpiresAt.IsZero() {
+			expired = !container.TTLExpiresAt.After(now)
+		} else if c.containerTTL > 0 {
+			ref := container.UpdatedAt
+			if container.LastHeartbeatAt != nil && !container.LastHeartbeatAt.IsZero() {
+				ref = container.LastHeartbeatAt.UTC()
+			}
+			if ref.IsZero() {
+				ref = container.UpdatedAt
+			}
+			expired = !ref.Add(c.containerTTL).After(now)
+		}
+		c.logger.Info("runtime container ttl check", "project_id", container.ProjectID, "container_id", container.ContainerID, "last_heartbeat_at", heartbeatInfo, "ttl_expires_at", ttlInfo, "expired", expired)
+		if expired {
 			if c.removeContainer(ctx, container, "expired", fmt.Sprintf("container exceeded ttl %s", formatDuration(c.containerTTL))) {
 				removed[container.ContainerID] = struct{}{}
 				touched[container.ProjectID] = struct{}{}

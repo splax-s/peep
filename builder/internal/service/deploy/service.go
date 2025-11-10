@@ -590,6 +590,9 @@ func (s Service) startRuntimeWatcher(req Request, deployment runtime.Deployment,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.runtimeSessions.Store(req.DeploymentID, cancel)
+	if s.logger != nil {
+		s.logger.Info("runtime heartbeat watcher started", "deployment_id", req.DeploymentID, "project_id", req.ProjectID, "interval", interval)
+	}
 	go s.runtimeHeartbeat(ctx, interval, req, deployment, image)
 }
 
@@ -605,6 +608,14 @@ func (s Service) runtimeHeartbeat(ctx context.Context, interval time.Duration, r
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	defer s.runtimeSessions.Delete(req.DeploymentID)
+	if s.logger != nil {
+		s.logger.Info("runtime heartbeat loop running", "deployment_id", req.DeploymentID, "project_id", req.ProjectID, "interval", interval)
+	}
+	defer func() {
+		if s.logger != nil {
+			s.logger.Info("runtime heartbeat loop stopped", "deployment_id", req.DeploymentID, "project_id", req.ProjectID)
+		}
+	}()
 
 	for {
 		select {
@@ -622,9 +633,10 @@ func (s Service) runtimeHeartbeat(ctx context.Context, interval time.Duration, r
 				continue
 			}
 
-			containerID := strings.TrimSpace(podStatus.ContainerID)
+			rawContainerID := strings.TrimSpace(podStatus.ContainerID)
+			containerID := strings.TrimSpace(deployment.PodName)
 			if containerID == "" {
-				containerID = deployment.PodName
+				containerID = rawContainerID
 			}
 			metadata := map[string]any{
 				"deployment_id": req.DeploymentID,
@@ -633,6 +645,9 @@ func (s Service) runtimeHeartbeat(ctx context.Context, interval time.Duration, r
 				"host_ip":       deployment.Host,
 				"host_port":     deployment.Port,
 				"phase":         strings.ToLower(podStatus.Phase),
+			}
+			if rawContainerID != "" && rawContainerID != containerID {
+				metadata["runtime_container_id"] = rawContainerID
 			}
 			if podStatus.CPUPercent > 0 {
 				metadata["cpu_percent"] = podStatus.CPUPercent
@@ -643,8 +658,14 @@ func (s Service) runtimeHeartbeat(ctx context.Context, interval time.Duration, r
 			if podStatus.StartedAt != nil {
 				metadata["runtime_started_at"] = podStatus.StartedAt.Format(time.RFC3339)
 			}
+			if s.logger != nil {
+				s.logger.Info("runtime heartbeat sample", "deployment_id", req.DeploymentID, "project_id", req.ProjectID, "phase", metadata["phase"], "cpu_percent", metadata["cpu_percent"], "memory_bytes", metadata["memory_bytes"])
+			}
 
-			_ = s.notifyStatus(req, "running", "metrics", "runtime heartbeat", image, "", metadata, nil)
+			delivered := s.notifyStatus(req, "running", "metrics", "runtime heartbeat", image, "", metadata, nil)
+			if !delivered && s.logger != nil {
+				s.logger.Warn("runtime heartbeat callback skipped", "deployment_id", req.DeploymentID, "project_id", req.ProjectID)
+			}
 			s.emitRuntimeEvent(nil, req, "runtime_metrics", "info", "runtime heartbeat", metadata)
 
 			if !strings.EqualFold(podStatus.Phase, "running") {
@@ -1047,6 +1068,9 @@ func (s Service) notifyStatus(req Request, status, stage, message, image, url st
 	}
 	projectKey := strings.TrimSpace(req.ProjectID)
 	if s.shouldSuppress(projectKey) {
+		if s.logger != nil {
+			s.logger.Info("callback suppressed", "deployment_id", req.DeploymentID, "project_id", req.ProjectID, "stage", stage)
+		}
 		return false
 	}
 	payload := statusPayload{
@@ -1103,6 +1127,9 @@ func (s Service) notifyStatus(req Request, status, stage, message, image, url st
 			s.suppress(projectKey)
 			return false
 		}
+	}
+	if s.logger != nil && strings.EqualFold(stage, "metrics") {
+		s.logger.Info("runtime metrics callback delivered", "deployment_id", req.DeploymentID, "project_id", req.ProjectID, "status", status)
 	}
 	return true
 }

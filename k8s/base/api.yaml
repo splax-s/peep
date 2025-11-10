@@ -44,6 +44,9 @@ spec:
           ports:
             - name: http
               containerPort: 4000
+          volumeMounts:
+            - name: nginx-generated
+              mountPath: /var/lib/peep/nginx
           envFrom:
             - configMapRef:
                 name: api-config
@@ -70,6 +73,10 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+      volumes:
+        - name: nginx-generated
+          persistentVolumeClaim:
+            claimName: nginx-generated
 ---
 apiVersion: v1
 kind: ServiceAccount

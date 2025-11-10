@@ -43,7 +43,18 @@ spec:
                 name: builder
                 port:
                   name: http
+    - host: '*.peep.com'
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: edge-nginx
+                port:
+                  name: http
   tls:
     - hosts:
         - peep.com
+        - '*.peep.com'
       secretName: peep-tls

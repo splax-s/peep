@@ -1,4 +1,19 @@
 apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nginx-generated
+  namespace: peep
+  labels:
+    app.kubernetes.io/name: nginx
+    app.kubernetes.io/component: ingress
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: edge-nginx
@@ -36,6 +51,7 @@ spec:
         app.kubernetes.io/name: nginx
         app.kubernetes.io/component: ingress
     spec:
+      shareProcessNamespace: true
       containers:
         - name: nginx
           image: nginx:1.27-alpine
@@ -77,9 +93,38 @@ spec:
             limits:
               cpu: 300m
               memory: 256Mi
+        - name: nginx-reloader
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -euo pipefail
+              apk add --no-cache inotify-tools >/dev/null
+              while ! pgrep nginx >/dev/null; do
+                sleep 1
+              done
+              inotifywait -m -e close_write,delete,move /etc/nginx/generated | while read -r dir events file; do
+                printf '%s nginx reload triggered: %s %s\n' "$(date -Iseconds)" "$events" "$file"
+                if ! pkill -HUP nginx; then
+                  printf '%s nginx reload trigger failed\n' "$(date -Iseconds)" >&2
+                fi
+              done
+          volumeMounts:
+            - name: generated
+              mountPath: /etc/nginx/generated
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
       volumes:
         - name: nginx-config
           configMap:
             name: nginx-config
         - name: generated
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: nginx-generated

@@ -24,16 +24,18 @@ type ProjectEnvVar struct {
 
 // ProjectContainer tracks running container endpoints for ingress wiring.
 type ProjectContainer struct {
-	ID            string
-	ProjectID     string
-	DeploymentID  string
-	ContainerID   string
-	Status        string
-	HostIP        string
-	HostPort      int
-	CPUPercent    *float64
-	MemoryBytes   *int64
-	UptimeSeconds *int64
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID              string
+	ProjectID       string
+	DeploymentID    string
+	ContainerID     string
+	Status          string
+	HostIP          string
+	HostPort        int
+	CPUPercent      *float64
+	MemoryBytes     *int64
+	UptimeSeconds   *int64
+	LastHeartbeatAt *time.Time
+	TTLExpiresAt    *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }

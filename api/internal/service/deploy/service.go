@@ -413,11 +413,9 @@ func (s Service) normalizeDeploymentURL(ctx context.Context, payload CallbackPay
 		return raw
 	}
 	parsed := parseURLWithFallback(raw)
-	scheme := defaultSchemeForEnv(s.cfg.Environment)
-	if parsed != nil && strings.EqualFold(parsed.Scheme, "https") {
-		scheme = "https"
-	}
-	result := &url.URL{Scheme: scheme, Host: hostWithPort(host, 8080)}
+	scheme := resolveIngressScheme(parsed, s.cfg)
+	port := sanitizePublicPort(scheme, s.cfg.IngressPublicPort)
+	result := &url.URL{Scheme: scheme, Host: hostWithPort(host, port)}
 	if parsed != nil {
 		result.Path = parsed.Path
 		result.RawQuery = parsed.RawQuery
@@ -465,6 +463,31 @@ func parseURLWithFallback(raw string) *url.URL {
 	return nil
 }
 
+func resolveIngressScheme(parsed *url.URL, cfg config.APIConfig) string {
+	override := strings.ToLower(strings.TrimSpace(cfg.IngressDefaultScheme))
+	switch override {
+	case "http", "https":
+		return override
+	default:
+		if override != "" {
+			return override
+		}
+	}
+
+	scheme := defaultSchemeForEnv(cfg.Environment)
+	if parsed == nil {
+		return scheme
+	}
+	parsedScheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	if parsedScheme == "https" {
+		return "https"
+	}
+	if parsedScheme == "http" && scheme != "https" {
+		return "http"
+	}
+	return scheme
+}
+
 func defaultSchemeForEnv(env string) string {
 	if strings.EqualFold(strings.TrimSpace(env), "production") {
 		return "https"
@@ -485,6 +508,20 @@ func hostWithPort(host string, port int) string {
 		}
 	}
 	return fmt.Sprintf("%s:%d", host, port)
+}
+
+func sanitizePublicPort(scheme string, port int) int {
+	if port <= 0 {
+		return 0
+	}
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if scheme == "https" && port == 443 {
+		return 0
+	}
+	if scheme == "http" && port == 80 {
+		return 0
+	}
+	return port
 }
 
 func mapBuilderStatus(raw string) string {
@@ -584,7 +621,7 @@ func toPtr(t time.Time) *time.Time {
 }
 
 func (s Service) handleIngress(ctx context.Context, payload CallbackPayload, metadata map[string]any, status string) {
-	if s.containers == nil || s.ingress == nil {
+	if s.containers == nil {
 		return
 	}
 	containerID, _ := metadata["container_id"].(string)
@@ -651,12 +688,37 @@ func (s Service) handleIngress(ctx context.Context, payload CallbackPayload, met
 	if uptime, ok := parseInt64(metadata["uptime_seconds"]); ok {
 		container.UptimeSeconds = &uptime
 	}
+	if stage == "ready" || stage == "metrics" {
+		heartbeat := payload.Timestamp.UTC()
+		if heartbeat.IsZero() {
+			heartbeat = time.Now().UTC()
+		}
+		if hb := timeRef(heartbeat); hb != nil {
+			container.LastHeartbeatAt = hb
+			metadata["last_heartbeat_at"] = heartbeat.Format(time.RFC3339Nano)
+		}
+		if ttl := s.cfg.RuntimeContainerTTL; ttl > 0 {
+			expiresAt := heartbeat.Add(ttl)
+			if exp := timeRef(expiresAt); exp != nil {
+				container.TTLExpiresAt = exp
+				metadata["ttl_expires_at"] = expiresAt.Format(time.RFC3339Nano)
+			}
+		}
+	}
 
 	if err := s.containers.UpsertContainer(opCtx, container); err != nil {
 		s.logger.Warn("failed to upsert container metadata", "deployment_id", payload.DeploymentID, "container_id", containerID, "error", err)
 		return
 	}
 	if stage == "metrics" {
+		var heartbeatVal, ttlVal string
+		if container.LastHeartbeatAt != nil {
+			heartbeatVal = container.LastHeartbeatAt.UTC().Format(time.RFC3339Nano)
+		}
+		if container.TTLExpiresAt != nil {
+			ttlVal = container.TTLExpiresAt.UTC().Format(time.RFC3339Nano)
+		}
+		s.logger.Info("runtime container heartbeat persisted", "project_id", projectID, "deployment_id", payload.DeploymentID, "container_id", containerID, "heartbeat_at", heartbeatVal, "ttl_expires_at", ttlVal)
 		return
 	}
 	if err := s.containers.RemoveStaleContainers(opCtx, projectID, containerID); err != nil {
@@ -683,6 +745,14 @@ func (s Service) syncIngress(ctx context.Context, projectID string) {
 	if err := s.ingress.Apply(ctx, *project, containers); err != nil {
 		s.logger.Warn("failed to apply ingress config", "project_id", projectID, "error", err)
 	}
+}
+
+func timeRef(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	value := t.UTC()
+	return &value
 }
 
 func parseHostPort(value any) (int, bool) {

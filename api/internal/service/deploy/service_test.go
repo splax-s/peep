@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,11 +98,64 @@ func TestProcessCallbackRefreshesStatusForMetricsStage(t *testing.T) {
 	}
 }
 
+func TestProcessCallbackRecordsHeartbeatAndTTL(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	recorder := &recordingContainerRepo{}
+	depRepo := &fakeDeploymentRepo{}
+	svc := newTestService(func(s *Service) {
+		s.deployments = depRepo
+		s.containers = recorder
+		s.ingress = nil
+		s.cfg.RuntimeContainerTTL = 60 * time.Second
+	})
+
+	payload := CallbackPayload{
+		DeploymentID: uuid.NewString(),
+		ProjectID:    uuid.NewString(),
+		Status:       "running",
+		Stage:        "metrics",
+		Timestamp:    now,
+		Metadata: map[string]any{
+			"container_id": "container-ttl",
+			"host_port":    3000,
+		},
+	}
+
+	if err := svc.ProcessCallback(context.Background(), payload); err != nil {
+		t.Fatalf("ProcessCallback returned error: %v", err)
+	}
+	recorded, ok := recorder.last()
+	if !ok {
+		t.Fatal("expected container heartbeat to be recorded")
+	}
+	if recorded.ProjectID != payload.ProjectID {
+		t.Fatalf("expected project_id %s, got %s", payload.ProjectID, recorded.ProjectID)
+	}
+	if recorded.LastHeartbeatAt == nil {
+		t.Fatal("expected last heartbeat timestamp to be set")
+	}
+	hb := recorded.LastHeartbeatAt.UTC()
+	if !hb.Truncate(time.Millisecond).Equal(now) {
+		t.Fatalf("expected heartbeat %s, got %s", now, hb)
+	}
+	if recorded.TTLExpiresAt == nil {
+		t.Fatal("expected ttl expiration timestamp to be set")
+	}
+	extra := now.Add(60 * time.Second).Truncate(time.Millisecond)
+	expires := recorded.TTLExpiresAt.UTC()
+	if !expires.Truncate(time.Millisecond).Equal(extra) {
+		t.Fatalf("expected ttl expiry %s, got %s", extra, expires)
+	}
+	if recorder.upsertCount() != 1 {
+		t.Fatalf("expected one upsert call, got %d", recorder.upsertCount())
+	}
+}
+
 func TestProcessCallbackNormalizesDeploymentURL(t *testing.T) {
 	projectID := uuid.NewString()
 	depRepo := &fakeDeploymentRepo{}
 	project := domain.Project{ID: projectID, Name: "My App"}
-	cfg := config.APIConfig{IngressDomainSuffix: ".dev.peep", Environment: "production"}
+	cfg := config.APIConfig{IngressDomainSuffix: ".dev.peep", Environment: "production", IngressPublicPort: 8080}
 
 	svc := newTestService(func(s *Service) {
 		s.deployments = depRepo
@@ -161,7 +215,7 @@ func TestProcessCallbackPreservesHttpsScheme(t *testing.T) {
 	svc := newTestService(func(s *Service) {
 		s.deployments = depRepo
 		s.projects = singleProjectRepo{project: project}
-		s.cfg = config.APIConfig{IngressDomainSuffix: ".dev.peep", Environment: "production"}
+		s.cfg = config.APIConfig{IngressDomainSuffix: ".dev.peep", Environment: "production", IngressPublicPort: 8080}
 	})
 
 	payload := CallbackPayload{
@@ -202,7 +256,7 @@ func TestProcessCallbackGeneratesURLFromHostPortWhenURLMissing(t *testing.T) {
 	svc := newTestService(func(s *Service) {
 		s.deployments = depRepo
 		s.projects = singleProjectRepo{project: project}
-		s.cfg = config.APIConfig{IngressDomainSuffix: ".example.test", Environment: "staging"}
+		s.cfg = config.APIConfig{IngressDomainSuffix: ".example.test", Environment: "staging", IngressPublicPort: 8080}
 	})
 
 	payload := CallbackPayload{
@@ -234,6 +288,47 @@ func TestProcessCallbackGeneratesURLFromHostPortWhenURLMissing(t *testing.T) {
 	}
 	if meta["public_url"] != wantURL {
 		t.Fatalf("expected public_url %q, got %v", wantURL, meta["public_url"])
+	}
+}
+
+func TestNormalizeDeploymentURLRespectsConfiguredScheme(t *testing.T) {
+	projectID := uuid.NewString()
+	depRepo := &fakeDeploymentRepo{}
+	project := domain.Project{ID: projectID, Name: "Preview"}
+
+	svc := newTestService(func(s *Service) {
+		s.deployments = depRepo
+		s.projects = singleProjectRepo{project: project}
+		s.cfg = config.APIConfig{IngressDomainSuffix: ".peep.test", Environment: "development", IngressPublicPort: 0, IngressDefaultScheme: "https"}
+	})
+
+	payload := CallbackPayload{
+		DeploymentID: uuid.NewString(),
+		ProjectID:    projectID,
+		Status:       "running",
+		Stage:        "ready",
+		URL:          "http://127.0.0.1:49155",
+		Metadata: map[string]any{
+			"host_port": "49155",
+		},
+		Timestamp: time.Now().UTC(),
+	}
+
+	if err := svc.ProcessCallback(context.Background(), payload); err != nil {
+		t.Fatalf("ProcessCallback returned error: %v", err)
+	}
+
+	gotURL := strings.TrimSpace(depRepo.lastUpdate.URL)
+	wantURL := "https://preview.peep.test"
+	if gotURL != wantURL {
+		t.Fatalf("expected normalized url %q, got %q", wantURL, gotURL)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(depRepo.lastUpdate.Metadata, &meta); err != nil {
+		t.Fatalf("decode metadata failed: %v", err)
+	}
+	if meta["public_url"] != wantURL {
+		t.Fatalf("expected public_url metadata %q, got %v", wantURL, meta["public_url"])
 	}
 }
 
@@ -375,6 +470,52 @@ func (fakeContainerRepo) ListProjectContainers(context.Context, string) ([]domai
 func (fakeContainerRepo) RemoveStaleContainers(context.Context, string, string) error { return nil }
 func (fakeContainerRepo) ListContainers(context.Context) ([]domain.ProjectContainer, error) {
 	return nil, nil
+}
+
+type recordingContainerRepo struct {
+	mu        sync.Mutex
+	container domain.ProjectContainer
+	has       bool
+	upserts   int
+}
+
+func (r *recordingContainerRepo) UpsertContainer(_ context.Context, container domain.ProjectContainer) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.container = container
+	r.has = true
+	r.upserts++
+	return nil
+}
+
+func (r *recordingContainerRepo) DeleteContainer(context.Context, string) error { return nil }
+
+func (r *recordingContainerRepo) DeleteContainersByDeployment(context.Context, string) error {
+	return nil
+}
+
+func (r *recordingContainerRepo) ListProjectContainers(context.Context, string) ([]domain.ProjectContainer, error) {
+	return nil, nil
+}
+
+func (r *recordingContainerRepo) RemoveStaleContainers(context.Context, string, string) error {
+	return nil
+}
+
+func (r *recordingContainerRepo) ListContainers(context.Context) ([]domain.ProjectContainer, error) {
+	return nil, nil
+}
+
+func (r *recordingContainerRepo) last() (domain.ProjectContainer, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.container, r.has
+}
+
+func (r *recordingContainerRepo) upsertCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.upserts
 }
 
 type fakeLogRepo struct{}
