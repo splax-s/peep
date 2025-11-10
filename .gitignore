@@ -1,0 +1,66 @@
+# Global build artifacts
+bin/
+build/
+dist/
+public/dist/
+coverage/
+.tmp/
+.tmp-*/
+.DS_Store
+Thumbs.db
+
+# Go build outputs
+**/*.out
+**/*.test
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+
+# Node / Next.js
+node_modules/
+.next/
+.next-static/
+yarn-error.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Environment files
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs
+*.log
+logs/
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker / Kubernetes
+**/.docker-target/
+**/docker-cache/
+
+# Generated certificates and keys
+*.pem
+*.crt
+*.key
+*.pfx
+
+# Temporary data
+*.tmp
+*.temp
+*.pid
+*.pid.lock
+
+# macOS system files
+.Trashes
+.AppleDouble
+.LSOverride
+
+.github/copilot-instructions.md
